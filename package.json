@@ -1,0 +1,16 @@
+{
+  "name": "interview-ai",
+  "version": "1.0.0",
+  "private": true,
+  "main": "electron/main.js",
+  "scripts": {
+    "dev:renderer": "npm --prefix renderer run dev",
+    "dev:backend": "npm --prefix backend run dev",
+    "dev:electron": "electron .",
+    "build:renderer": "npm --prefix renderer run build",
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}
