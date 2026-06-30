@@ -18,8 +18,8 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 const SYSTEM_PROMPT = `You are a calm, sharp interview co-pilot. You receive a live transcript fragment of
 a question being asked in a job interview. Reply with a concise, well-structured suggested answer
-the candidate could say out loud. Keep it under 120 words, use plain spoken language, and skip any
-preamble like "Sure" or "Here's an answer" — just give the answer content itself.`;
+the candidate could say out loud. Keep it under 500 words, use plain spoken language, and skip any
+preamble like "Sure" or "Here's an answer" — just give the answer content itself. Give answer in bullet and examples If It is technical give some code examples.`;
 
 async function generateAnswer(transcriptText) {
   const message = await anthropic.messages.create({
@@ -99,9 +99,22 @@ wss.on('connection', (clientSocket) => {
     send({ type: 'status', message: 'transcription-closed' });
   });
 
-  clientSocket.on('message', (chunk, isBinary) => {
+  clientSocket.on('message', async (chunk, isBinary) => {
     if (!isBinary) {
-      console.log('[ws] received non-binary message, ignoring:', chunk.toString());
+      try {
+        const message = JSON.parse(chunk.toString());
+        if (message.type === 'text-question') {
+          console.log('[ws] received text question:', message.text);
+          try {
+            const answer = await generateAnswer(message.text);
+            send({ type: 'answer', question: message.text, answer });
+          } catch (err) {
+            send({ type: 'error', message: `LLM error: ${err.message}` });
+          }
+        }
+      } catch (err) {
+        console.log('[ws] received non-binary message, ignoring:', chunk.toString());
+      }
       return;
     }
     chunkCount += 1;

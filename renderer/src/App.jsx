@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 const WS_URL = window.appConfig?.backendWsUrl ?? 'ws://localhost:8787/ws';
 
@@ -10,6 +13,9 @@ export default function App() {
   const [qaLog, setQaLog] = useState([]);
   const [statusMessage, setStatusMessage] = useState('idle');
   const [micLevel, setMicLevel] = useState(0);
+  const [textInput, setTextInput] = useState('');
+  const [isSendingText, setIsSendingText] = useState(false);
+  const [opacity, setOpacity] = useState(0.85);
 
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
@@ -99,11 +105,72 @@ export default function App() {
     setStatusMessage('idle');
   }
 
+  async function sendTextQuestion() {
+    const trimmedText = textInput.trim();
+    if (!trimmedText) return;
+    
+    setIsSendingText(true);
+    setTextInput('');
+    
+    // If audio WebSocket is open, use it
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'text-question', text: trimmedText }));
+      setIsSendingText(false);
+      return;
+    }
+    
+    // Otherwise create a temporary connection just for this text question
+    const tempWs = new WebSocket(WS_URL);
+    
+    tempWs.onopen = () => {
+      tempWs.send(JSON.stringify({ type: 'text-question', text: trimmedText }));
+    };
+    
+    tempWs.onmessage = (event) => {
+      const payload = JSON.parse(event.data);
+      if (payload.type === 'answer') {
+        setQaLog((prev) => [...prev, { question: payload.question, answer: payload.answer }]);
+        tempWs.close();
+      } else if (payload.type === 'error') {
+        setStatusMessage(payload.message);
+        tempWs.close();
+      }
+    };
+    
+    tempWs.onerror = () => {
+      setStatusMessage('connection error');
+      setIsSendingText(false);
+    };
+    
+    tempWs.onclose = () => {
+      setIsSendingText(false);
+    };
+  }
+
+  function handleTextKeyDown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendTextQuestion();
+    }
+  }
+
   return (
-    <div className="app">
-      <header>
+    <div className="app" style={{ backgroundColor: `rgba(17, 20, 24, ${opacity})` }}>
+      <header className="drag-region">
         <h1>Interview Copilot</h1>
-        <span className={`status status-${statusMessage}`}>{statusMessage}</span>
+        <div className="header-right">
+          <input
+            type="range"
+            className="opacity-slider"
+            min="0.2"
+            max="1"
+            step="0.05"
+            value={opacity}
+            onChange={(e) => setOpacity(parseFloat(e.target.value))}
+            title={`Opacity: ${Math.round(opacity * 100)}%`}
+          />
+          <span className={`status status-${statusMessage}`}>{statusMessage}</span>
+        </div>
       </header>
 
       <div className="controls">
@@ -142,6 +209,29 @@ export default function App() {
         </div>
       )}
 
+      <div className="text-input-section">
+        <div className="text-input-label">Type question if audio is unclear:</div>
+        <div className="text-input-row">
+          <textarea
+            className="text-input"
+            placeholder="Type the interview question here..."
+            value={textInput}
+            onChange={(e) => setTextInput(e.target.value)}
+            onKeyDown={handleTextKeyDown}
+            disabled={isSendingText}
+            rows={2}
+          />
+          <button
+            className="send-btn"
+            onClick={sendTextQuestion}
+            disabled={!textInput.trim() || isSendingText}
+            title="Send question to get answer"
+          >
+            {isSendingText ? '...' : 'Send'}
+          </button>
+        </div>
+      </div>
+
       <div className="qa-log">
         {qaLog
           .slice()
@@ -149,7 +239,36 @@ export default function App() {
           .map((qa, i) => (
             <div key={i} className="qa-item">
               <div className="question">Q: {qa.question}</div>
-              <div className="answer">{qa.answer}</div>
+              <div className="answer">
+                <ReactMarkdown
+                  components={{
+                    code({ node, inline, className, children, ...props }) {
+                      const match = /language-(\w+)/.exec(className || '');
+                      return !inline && match ? (
+                        <SyntaxHighlighter
+                          style={oneDark}
+                          language={match[1]}
+                          PreTag="div"
+                          customStyle={{
+                            margin: '8px 0',
+                            borderRadius: '6px',
+                            fontSize: '12px',
+                          }}
+                          {...props}
+                        >
+                          {String(children).replace(/\n$/, '')}
+                        </SyntaxHighlighter>
+                      ) : (
+                        <code className="inline-code" {...props}>
+                          {children}
+                        </code>
+                      );
+                    },
+                  }}
+                >
+                  {qa.answer}
+                </ReactMarkdown>
+              </div>
             </div>
           ))}
       </div>

@@ -10,7 +10,9 @@ function createWindow() {
     width: 420,
     height: 640,
     alwaysOnTop: true,
-    frame: true,
+    frame: false,
+    transparent: true,
+    hasShadow: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
