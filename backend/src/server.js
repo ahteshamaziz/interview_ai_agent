@@ -1,10 +1,15 @@
 require('dotenv').config();
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const Anthropic = require('@anthropic-ai/sdk');
+const { connectDb } = require('./db');
+const { initEmbeddings } = require('./embeddings');
+const { lookupAnswer, saveAnswer, backfillEmbeddings } = require('./knowledgeBase');
 
 const PORT = process.env.PORT || 8787;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
@@ -34,9 +39,74 @@ async function generateAnswer(transcriptText) {
     .join('');
 }
 
+async function resolveAnswer(question) {
+  const cached = await lookupAnswer(question);
+  if (cached) {
+    console.log(`[kb] cache hit (${cached.matchType}): "${question}"`);
+    return {
+      answer: cached.answer,
+      source: 'cache',
+      matchType: cached.matchType,
+      matchedQuestion: cached.matchedQuestion,
+    };
+  }
+
+  console.log(`[kb] cache miss, calling model: "${question}"`);
+  const answer = await generateAnswer(question);
+  await saveAnswer(question, answer);
+  return { answer, source: 'model' };
+}
+
+const SCREENSHOTS_DIR = path.join(__dirname, '../../screenshots');
+if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+
+// Step 1: extract the question text from the screenshot as plain text
+const EXTRACT_QUESTION_PROMPT = `Look at this screenshot and extract the interview or coding question shown on screen as plain text. Return ONLY the question text itself — no preamble, no explanation. If multiple questions are visible, return the most prominent one. If no question is visible, return the single word: NONE.`;
+
+
 const app = express();
 app.use(cors());
+app.use(express.json({ limit: '15mb' }));
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.post('/analyze-screenshot', async (req, res) => {
+  const { imageBase64 } = req.body;
+  if (!imageBase64) return res.status(400).json({ error: 'No image provided' });
+
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `screenshot-${timestamp}.png`;
+    const filepath = path.join(SCREENSHOTS_DIR, filename);
+    fs.writeFileSync(filepath, Buffer.from(imageBase64, 'base64'));
+    console.log(`[screenshot] saved to ${filepath}`);
+
+    // Step 1: extract the question text from the image
+    const extractMsg = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 300,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
+          { type: 'text', text: EXTRACT_QUESTION_PROMPT },
+        ],
+      }],
+    });
+    const extractedQuestion = extractMsg.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    console.log(`[screenshot] extracted question: "${extractedQuestion}"`);
+
+    if (extractedQuestion === 'NONE') {
+      return res.json({ answer: 'No interview or coding question was detected in the screenshot.', savedAs: filename, question: null, source: 'model' });
+    }
+
+    // Step 2: resolve through the same cache+KB pipeline as audio/text questions
+    const result = await resolveAnswer(extractedQuestion);
+    res.json({ ...result, savedAs: filename, question: extractedQuestion });
+  } catch (err) {
+    console.error('[screenshot] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -81,10 +151,10 @@ wss.on('connection', (clientSocket) => {
     const speechFinal = Boolean(data.speech_final);
     if (speechFinal) {
       try {
-        const answer = await generateAnswer(text);
-        send({ type: 'answer', question: text, answer });
+        const result = await resolveAnswer(text);
+        send({ type: 'answer', question: text, ...result });
       } catch (err) {
-        send({ type: 'error', message: `LLM error: ${err.message}` });
+        send({ type: 'error', message: `Answer error: ${err.message}` });
       }
     }
   });
@@ -106,10 +176,10 @@ wss.on('connection', (clientSocket) => {
         if (message.type === 'text-question') {
           console.log('[ws] received text question:', message.text);
           try {
-            const answer = await generateAnswer(message.text);
-            send({ type: 'answer', question: message.text, answer });
+            const result = await resolveAnswer(message.text);
+            send({ type: 'answer', question: message.text, ...result });
           } catch (err) {
-            send({ type: 'error', message: `LLM error: ${err.message}` });
+            send({ type: 'error', message: `Answer error: ${err.message}` });
           }
         }
       } catch (err) {
@@ -134,6 +204,15 @@ wss.on('connection', (clientSocket) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Backend listening on http://localhost:${PORT} (ws path: /ws)`);
-});
+connectDb()
+  .then(() => initEmbeddings())
+  .then(() => backfillEmbeddings())
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`Backend listening on http://localhost:${PORT} (ws path: /ws)`);
+    });
+  })
+  .catch((err) => {
+    console.error('[startup] failed:', err.message);
+    process.exit(1);
+  });

@@ -54,6 +54,29 @@ header {
   accent-color: #2563eb;
 }
 
+.stealth-toggle {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.stealth-on {
+  background: rgba(34, 197, 94, 0.2);
+  color: #4ade80;
+  border-color: rgba(34, 197, 94, 0.35);
+}
+
+.stealth-off {
+  background: rgba(251, 146, 60, 0.2);
+  color: #fb923c;
+  border-color: rgba(251, 146, 60, 0.35);
+}
+
 h1 {
   font-size: 16px;
   margin: 0;
@@ -278,4 +301,54 @@ button {
 
 .answer a:hover {
   text-decoration: underline;
+}
+
+.source-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+}
+
+.source-cache {
+  background: rgba(34, 197, 94, 0.2);
+  color: #4ade80;
+  border: 1px solid rgba(34, 197, 94, 0.35);
+}
+
+.source-model {
+  background: rgba(59, 130, 246, 0.2);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+}
+
+.screenshot-section {
+  display: flex;
+}
+
+.screenshot-btn {
+  flex: 1;
+  padding: 8px 12px;
+  background: rgba(139, 92, 246, 0.2);
+  color: #c4b5fd;
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.screenshot-btn:hover:not(:disabled) {
+  background: rgba(139, 92, 246, 0.35);
+}
+
+.screenshot-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
