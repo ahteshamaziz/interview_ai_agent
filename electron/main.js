@@ -48,6 +48,15 @@ ipcMain.handle('set-content-protection', (_event, enabled) => {
   return contentProtectionEnabled;
 });
 
+ipcMain.handle('move-window', (_event, deltaX, deltaY) => {
+  if (!mainWindow) return null;
+  const dx = Number(deltaX) || 0;
+  const dy = Number(deltaY) || 0;
+  const [x, y] = mainWindow.getPosition();
+  mainWindow.setPosition(x + dx, y + dy, false);
+  return mainWindow.getPosition();
+});
+
 ipcMain.handle('capture-screen', async () => {
   // On macOS, check screen recording permission before attempting capture
   if (process.platform === 'darwin') {

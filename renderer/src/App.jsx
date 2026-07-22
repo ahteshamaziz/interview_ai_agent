@@ -4,6 +4,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 
 const WS_URL = window.appConfig?.backendWsUrl ?? 'ws://localhost:8787/ws';
+const BACKEND_HTTP_URL = WS_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
 
 export default function App() {
   const [devices, setDevices] = useState([]);
@@ -16,6 +17,9 @@ export default function App() {
   const [textInput, setTextInput] = useState('');
   const [isSendingText, setIsSendingText] = useState(false);
   const [opacity, setOpacity] = useState(0.85);
+  const [stealthEnabled, setStealthEnabled] = useState(true);
+  const [stealthAvailable, setStealthAvailable] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
 
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
@@ -23,6 +27,7 @@ export default function App() {
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
   const levelLoopRef = useRef(null);
+  const textareaRef = useRef(null);
 
   useEffect(() => {
     navigator.mediaDevices.enumerateDevices().then((deviceList) => {
@@ -31,6 +36,135 @@ export default function App() {
       if (inputs.length > 0) setSelectedDeviceId(inputs[0].deviceId);
     });
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    const hasApi =
+      Boolean(window.appConfig?.getContentProtection) &&
+      Boolean(window.appConfig?.setContentProtection);
+    setStealthAvailable(hasApi);
+    if (!hasApi) return;
+
+    window.appConfig
+      .getContentProtection()
+      .then((enabled) => {
+        if (!cancelled) setStealthEnabled(Boolean(enabled));
+      })
+      .catch(() => {
+        if (!cancelled) setStealthAvailable(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function toggleStealth() {
+    if (!stealthAvailable) return;
+    const next = !stealthEnabled;
+    setStealthEnabled(next);
+    try {
+      await window.appConfig.setContentProtection(next);
+    } catch {
+      // revert if it failed
+      setStealthEnabled(!next);
+    }
+  }
+
+  async function captureAndAnalyzeScreen() {
+    if (!window.appConfig?.captureScreen) {
+      setStatusMessage('screenshot unavailable');
+      return;
+    }
+    setIsCapturing(true);
+    setStatusMessage('capturing...');
+    try {
+      const imageBase64 = await window.appConfig.captureScreen();
+      const res = await fetch(`${BACKEND_HTTP_URL}/analyze-screenshot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageBase64 }),
+      });
+      const payload = await res.json();
+      if (!res.ok) throw new Error(payload?.error || 'screenshot analyze failed');
+
+      setQaLog((prev) => [
+        ...prev,
+        {
+          question: payload.question || '(screenshot)',
+          answer: payload.answer,
+          source: payload.source,
+          matchType: payload.matchType,
+          matchedQuestion: payload.matchedQuestion,
+          savedAs: payload.savedAs,
+        },
+      ]);
+      setStatusMessage('screenshot answered');
+    } catch (err) {
+      setStatusMessage(err.message || 'screenshot error');
+    } finally {
+      setIsCapturing(false);
+    }
+  }
+
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      // Avoid stealing keystrokes while typing (except explicit shortcuts).
+      const isTypingTarget =
+        e.target &&
+        (e.target.tagName === 'TEXTAREA' ||
+          e.target.tagName === 'INPUT' ||
+          e.target.isContentEditable);
+
+      const key = e.key;
+      const ctrlOrCmd = e.ctrlKey || e.metaKey;
+
+      // Window move: Alt + Arrow (Shift = faster)
+      if (e.altKey && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(key)) {
+        e.preventDefault();
+        const step = e.shiftKey ? 40 : 12;
+        const dx = key === 'ArrowLeft' ? -step : key === 'ArrowRight' ? step : 0;
+        const dy = key === 'ArrowUp' ? -step : key === 'ArrowDown' ? step : 0;
+        window.appConfig?.moveWindow?.(dx, dy);
+        return;
+      }
+
+      // Shortcuts below require Ctrl/Cmd
+      if (!ctrlOrCmd) return;
+
+      // Ctrl/Cmd + L: start/stop listening
+      if (key.toLowerCase() === 'l') {
+        e.preventDefault();
+        if (isListening) stopListening();
+        else startListening();
+        return;
+      }
+
+      // Ctrl/Cmd + K: focus typing box
+      if (key.toLowerCase() === 'k') {
+        e.preventDefault();
+        textareaRef.current?.focus();
+        return;
+      }
+
+      // Ctrl/Cmd + P: capture screenshot
+      if (key.toLowerCase() === 'p') {
+        e.preventDefault();
+        captureAndAnalyzeScreen();
+        return;
+      }
+
+      // Ctrl/Cmd + Shift + X: clear Q/A history
+      if (e.shiftKey && key.toLowerCase() === 'x') {
+        e.preventDefault();
+        if (isTypingTarget) return;
+        setQaLog([]);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isListening, stealthAvailable, stealthEnabled]);
 
   async function startListening() {
     const ws = new WebSocket(WS_URL);
@@ -47,7 +181,16 @@ export default function App() {
       } else if (payload.type === 'transcript') {
         setTranscript(payload.text);
       } else if (payload.type === 'answer') {
-        setQaLog((prev) => [...prev, { question: payload.question, answer: payload.answer }]);
+        setQaLog((prev) => [
+          ...prev,
+          {
+            question: payload.question,
+            answer: payload.answer,
+            source: payload.source,
+            matchType: payload.matchType,
+            matchedQuestion: payload.matchedQuestion,
+          },
+        ]);
         setTranscript('');
       } else if (payload.type === 'error') {
         setStatusMessage(payload.message);
@@ -129,7 +272,16 @@ export default function App() {
     tempWs.onmessage = (event) => {
       const payload = JSON.parse(event.data);
       if (payload.type === 'answer') {
-        setQaLog((prev) => [...prev, { question: payload.question, answer: payload.answer }]);
+        setQaLog((prev) => [
+          ...prev,
+          {
+            question: payload.question,
+            answer: payload.answer,
+            source: payload.source,
+            matchType: payload.matchType,
+            matchedQuestion: payload.matchedQuestion,
+          },
+        ]);
         tempWs.close();
       } else if (payload.type === 'error') {
         setStatusMessage(payload.message);
@@ -159,6 +311,21 @@ export default function App() {
       <header className="drag-region">
         <h1>Interview Copilot</h1>
         <div className="header-right">
+          {stealthAvailable && (
+            <button
+              type="button"
+              tabIndex={-1}
+              className={`stealth-toggle ${stealthEnabled ? 'stealth-on' : 'stealth-off'}`}
+              onClick={toggleStealth}
+              title={
+                stealthEnabled
+                  ? 'Stealth ON: window is excluded from screen capture'
+                  : 'Stealth OFF: window may appear in screen capture'
+              }
+            >
+              {stealthEnabled ? 'Hide: ON' : 'Hide: OFF'}
+            </button>
+          )}
           <input
             type="range"
             className="opacity-slider"
@@ -209,6 +376,17 @@ export default function App() {
         </div>
       )}
 
+      <div className="screenshot-section">
+        <button
+          className="screenshot-btn"
+          onClick={captureAndAnalyzeScreen}
+          disabled={isCapturing}
+          title="Capture screen (Ctrl/Cmd+P)"
+        >
+          {isCapturing ? 'Capturing…' : 'Capture Screen'}
+        </button>
+      </div>
+
       <div className="text-input-section">
         <div className="text-input-label">Type question if audio is unclear:</div>
         <div className="text-input-row">
@@ -220,6 +398,7 @@ export default function App() {
             onKeyDown={handleTextKeyDown}
             disabled={isSendingText}
             rows={2}
+            ref={textareaRef}
           />
           <button
             className="send-btn"
@@ -238,7 +417,14 @@ export default function App() {
           .reverse()
           .map((qa, i) => (
             <div key={i} className="qa-item">
-              <div className="question">Q: {qa.question}</div>
+              <div className="question">
+                Q: {qa.question}
+                {qa.source && (
+                  <span className={`source-badge ${qa.source === 'cache' ? 'source-cache' : 'source-model'}`}>
+                    {qa.source === 'cache' ? 'memory' : 'model'}
+                  </span>
+                )}
+              </div>
               <div className="answer">
                 <ReactMarkdown
                   components={{

@@ -31,6 +31,11 @@ Fill in:
 - `DEEPGRAM_API_KEY` — https://console.deepgram.com
 - `ANTHROPIC_API_KEY` — https://console.anthropic.com
 
+Optional tuning (helps when short pauses split a single question):
+- `DG_ENDPOINTING_MS` (default `900`): Deepgram endpointing sensitivity (ms). Higher = fewer splits.
+- `UTTERANCE_SILENCE_MS` (default `900`): silence debounce before generating an answer (ms).
+- `MIN_UTTERANCE_CHARS` (default `12`): ignore very short fragments.
+
 ### 3. (Optional) Capture interviewer audio too, not just your mic
 
 macOS doesn't expose system output audio as an input device by default. Install

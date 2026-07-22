@@ -14,6 +14,9 @@ const { lookupAnswer, saveAnswer, backfillEmbeddings } = require('./knowledgeBas
 const PORT = process.env.PORT || 8787;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const DG_ENDPOINTING_MS = Number(process.env.DG_ENDPOINTING_MS || 900);
+const UTTERANCE_SILENCE_MS = Number(process.env.UTTERANCE_SILENCE_MS || 900);
+const MIN_UTTERANCE_CHARS = Number(process.env.MIN_UTTERANCE_CHARS || 12);
 
 if (!DEEPGRAM_API_KEY) throw new Error('Missing DEEPGRAM_API_KEY in backend/.env');
 if (!ANTHROPIC_API_KEY) throw new Error('Missing ANTHROPIC_API_KEY in backend/.env');
@@ -55,6 +58,27 @@ async function resolveAnswer(question) {
   const answer = await generateAnswer(question);
   await saveAnswer(question, answer);
   return { answer, source: 'model' };
+}
+
+function looksLikeAQuestion(text) {
+  const t = String(text || '').trim();
+  if (!t) return false;
+  if (t.length < MIN_UTTERANCE_CHARS) return false;
+  // If we have a reasonable amount of text, treat it as answer-worthy even
+  // if it doesn't look like a question (many interview prompts are statements).
+  const wordCount = t.split(/\s+/).filter(Boolean).length;
+  if (wordCount >= 3) return true;
+  if (/[?]/.test(t)) return true;
+
+  // Common interview-style prompts without a question mark.
+  const startsLikeQuestion =
+    /^(what|why|how|when|where|who|which|can you|could you|would you|tell me|explain|walk me|describe)\b/i.test(t);
+  if (startsLikeQuestion) return true;
+
+  // If it ends like a clause, it's probably incomplete.
+  if (/[,:-]$/.test(t)) return false;
+
+  return true;
 }
 
 const SCREENSHOTS_DIR = path.join(__dirname, '../../screenshots');
@@ -116,6 +140,11 @@ wss.on('connection', (clientSocket) => {
   let chunkCount = 0;
   let dgIsOpen = false;
   const pendingChunks = [];
+  let finalBuffer = '';
+  let finalizeTimer = null;
+  let answerInFlight = false;
+  let lastAnsweredText = '';
+  let lastAnswerAt = 0;
 
   const send = (payload) => {
     if (clientSocket.readyState === clientSocket.OPEN) {
@@ -123,11 +152,45 @@ wss.on('connection', (clientSocket) => {
     }
   };
 
+  const clearFinalizeTimer = () => {
+    if (finalizeTimer) clearTimeout(finalizeTimer);
+    finalizeTimer = null;
+  };
+
+  const enqueueFinalize = () => {
+    clearFinalizeTimer();
+    finalizeTimer = setTimeout(async () => {
+      finalizeTimer = null;
+      const question = finalBuffer.trim();
+      finalBuffer = '';
+
+      if (!looksLikeAQuestion(question)) return;
+
+      // Prevent back-to-back duplicates from endpoint jitter.
+      const now = Date.now();
+      if (question === lastAnsweredText && now - lastAnswerAt < 3000) return;
+      if (answerInFlight) return;
+
+      answerInFlight = true;
+      lastAnsweredText = question;
+      lastAnswerAt = now;
+
+      try {
+        const result = await resolveAnswer(question);
+        send({ type: 'answer', question, ...result });
+      } catch (err) {
+        send({ type: 'error', message: `Answer error: ${err.message}` });
+      } finally {
+        answerInFlight = false;
+      }
+    }, UTTERANCE_SILENCE_MS);
+  };
+
   const dgConnection = deepgram.listen.live({
     model: 'nova-2',
     smart_format: true,
     interim_results: true,
-    endpointing: 300,
+    endpointing: DG_ENDPOINTING_MS,
   });
 
   dgConnection.on(LiveTranscriptionEvents.Open, () => {
@@ -148,15 +211,16 @@ wss.on('connection', (clientSocket) => {
     const isFinal = Boolean(data.is_final);
     send({ type: 'transcript', text, isFinal });
 
-    const speechFinal = Boolean(data.speech_final);
-    if (speechFinal) {
-      try {
-        const result = await resolveAnswer(text);
-        send({ type: 'answer', question: text, ...result });
-      } catch (err) {
-        send({ type: 'error', message: `Answer error: ${err.message}` });
-      }
+    if (isFinal) {
+      // Build a single utterance across short pauses.
+      finalBuffer = `${finalBuffer} ${text}`.trim();
+      // Keep "end of turn" debounce progressing even when `speech_final` is not emitted.
+      enqueueFinalize();
     }
+
+    // Deepgram can mark `speech_final` on short pauses; debounce before answering.
+    const speechFinal = Boolean(data.speech_final);
+    if (speechFinal) enqueueFinalize();
   });
 
   dgConnection.on(LiveTranscriptionEvents.Error, (err) => {
@@ -200,6 +264,7 @@ wss.on('connection', (clientSocket) => {
 
   clientSocket.on('close', () => {
     console.log(`[ws] client disconnected after ${chunkCount} chunks`);
+    clearFinalizeTimer();
     dgConnection.finish();
   });
 });
