@@ -6,6 +6,51 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 const WS_URL = window.appConfig?.backendWsUrl ?? 'ws://localhost:8787/ws';
 const BACKEND_HTTP_URL = WS_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
 
+// Auto-detect tuning: poll a cheap low-res thumbnail, only pay for a full
+// capture + analysis once the screen has held still for a couple of polls.
+const AUTO_DETECT_POLL_MS = 2000;
+const AUTO_DETECT_STABLE_POLLS = 2;
+const AUTO_DETECT_HASH_SIZE = 16; // 16x16 -> 256-bit hash
+const AUTO_DETECT_CHANGE_THRESHOLD = 10; // hamming distance out of 256 bits
+const AUTO_DETECT_PREVIEW_SIZE = { width: 320, height: 180 };
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+// Cheap perceptual hash (average hash) so we can tell "screen changed" from
+// "screen identical" without shipping every frame to the backend.
+async function computeImageHash(base64Png) {
+  const img = await loadImage(`data:image/png;base64,${base64Png}`);
+  const size = AUTO_DETECT_HASH_SIZE;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0, size, size);
+  const { data } = ctx.getImageData(0, 0, size, size);
+
+  const gray = new Array(size * size);
+  for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
+    gray[p] = (data[i] + data[i + 1] + data[i + 2]) / 3;
+  }
+  const avg = gray.reduce((a, b) => a + b, 0) / gray.length;
+  let bits = '';
+  for (const g of gray) bits += g >= avg ? '1' : '0';
+  return bits;
+}
+
+function hammingDistance(a, b) {
+  let d = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
+  return d;
+}
+
 export default function App() {
   const [devices, setDevices] = useState([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState('');
@@ -20,6 +65,8 @@ export default function App() {
   const [stealthEnabled, setStealthEnabled] = useState(true);
   const [stealthAvailable, setStealthAvailable] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
+  const [autoDetectEnabled, setAutoDetectEnabled] = useState(false);
+  const [autoDetectStatus, setAutoDetectStatus] = useState('off');
 
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
@@ -28,6 +75,7 @@ export default function App() {
   const analyserRef = useRef(null);
   const levelLoopRef = useRef(null);
   const textareaRef = useRef(null);
+  const autoDetectBusyRef = useRef(false);
 
   useEffect(() => {
     navigator.mediaDevices.enumerateDevices().then((deviceList) => {
@@ -71,6 +119,31 @@ export default function App() {
     }
   }
 
+  async function analyzeScreenshotImage(imageBase64) {
+    const res = await fetch(`${BACKEND_HTTP_URL}/analyze-screenshot`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ imageBase64 }),
+    });
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload?.error || 'screenshot analyze failed');
+
+    if (payload.question) {
+      setQaLog((prev) => [
+        ...prev,
+        {
+          question: payload.question,
+          answer: payload.answer,
+          source: payload.source,
+          matchType: payload.matchType,
+          matchedQuestion: payload.matchedQuestion,
+          savedAs: payload.savedAs,
+        },
+      ]);
+    }
+    return payload;
+  }
+
   async function captureAndAnalyzeScreen() {
     if (!window.appConfig?.captureScreen) {
       setStatusMessage('screenshot unavailable');
@@ -80,32 +153,80 @@ export default function App() {
     setStatusMessage('capturing...');
     try {
       const imageBase64 = await window.appConfig.captureScreen();
-      const res = await fetch(`${BACKEND_HTTP_URL}/analyze-screenshot`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ imageBase64 }),
-      });
-      const payload = await res.json();
-      if (!res.ok) throw new Error(payload?.error || 'screenshot analyze failed');
-
-      setQaLog((prev) => [
-        ...prev,
-        {
-          question: payload.question || '(screenshot)',
-          answer: payload.answer,
-          source: payload.source,
-          matchType: payload.matchType,
-          matchedQuestion: payload.matchedQuestion,
-          savedAs: payload.savedAs,
-        },
-      ]);
-      setStatusMessage('screenshot answered');
+      const payload = await analyzeScreenshotImage(imageBase64);
+      setStatusMessage(payload.question ? 'screenshot answered' : 'no question detected');
     } catch (err) {
       setStatusMessage(err.message || 'screenshot error');
     } finally {
       setIsCapturing(false);
     }
   }
+
+  function toggleAutoDetect() {
+    setAutoDetectEnabled((prev) => !prev);
+  }
+
+  // Auto-detect loop: poll a cheap low-res thumbnail on an interval, and only
+  // pay for a full-resolution capture + backend analysis once the screen has
+  // held still for a couple of consecutive polls (avoids re-answering while
+  // you're scrolling/typing, and avoids re-answering a screen we already saw).
+  useEffect(() => {
+    if (!autoDetectEnabled) {
+      setAutoDetectStatus('off');
+      return;
+    }
+    if (!window.appConfig?.captureScreen) {
+      setAutoDetectStatus('unavailable');
+      return;
+    }
+
+    let cancelled = false;
+    let prevHash = null;
+    let lastAnalyzedHash = null;
+    let stableCount = 0;
+
+    setAutoDetectStatus('watching');
+
+    const poll = async () => {
+      if (cancelled || autoDetectBusyRef.current) return;
+      try {
+        const previewBase64 = await window.appConfig.captureScreen(AUTO_DETECT_PREVIEW_SIZE);
+        if (cancelled) return;
+        const hash = await computeImageHash(previewBase64);
+        if (cancelled) return;
+
+        const changed = !prevHash || hammingDistance(hash, prevHash) > AUTO_DETECT_CHANGE_THRESHOLD;
+        stableCount = changed ? 0 : stableCount + 1;
+        prevHash = hash;
+
+        const alreadyAnalyzed =
+          lastAnalyzedHash && hammingDistance(hash, lastAnalyzedHash) <= AUTO_DETECT_CHANGE_THRESHOLD;
+
+        if (stableCount >= AUTO_DETECT_STABLE_POLLS - 1 && !alreadyAnalyzed) {
+          autoDetectBusyRef.current = true;
+          lastAnalyzedHash = hash;
+          setAutoDetectStatus('analyzing');
+          try {
+            const fullBase64 = await window.appConfig.captureScreen();
+            if (!cancelled) {
+              const payload = await analyzeScreenshotImage(fullBase64);
+              setAutoDetectStatus(payload.question ? 'answered' : 'watching');
+            }
+          } finally {
+            autoDetectBusyRef.current = false;
+          }
+        }
+      } catch (err) {
+        if (!cancelled) setAutoDetectStatus(err.message || 'error');
+      }
+    };
+
+    const id = setInterval(poll, AUTO_DETECT_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [autoDetectEnabled]);
 
   useEffect(() => {
     const onKeyDown = (e) => {
@@ -151,6 +272,13 @@ export default function App() {
       if (key.toLowerCase() === 'p') {
         e.preventDefault();
         captureAndAnalyzeScreen();
+        return;
+      }
+
+      // Ctrl/Cmd + Shift + A: toggle auto-detect
+      if (e.shiftKey && key.toLowerCase() === 'a') {
+        e.preventDefault();
+        toggleAutoDetect();
         return;
       }
 
@@ -384,6 +512,13 @@ export default function App() {
           title="Capture screen (Ctrl/Cmd+P)"
         >
           {isCapturing ? 'Capturing…' : 'Capture Screen'}
+        </button>
+        <button
+          className={`auto-detect-btn ${autoDetectEnabled ? 'auto-detect-on' : ''}`}
+          onClick={toggleAutoDetect}
+          title="Watch the screen and auto-answer when a new question appears (Ctrl/Cmd+Shift+A)"
+        >
+          {autoDetectEnabled ? `Auto-Detect: ${autoDetectStatus}` : 'Auto-Detect: OFF'}
         </button>
       </div>
 

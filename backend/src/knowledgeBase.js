@@ -2,7 +2,12 @@ const { getDb } = require('./db');
 const { embedText, cosineSimilarity } = require('./embeddings');
 
 const COLLECTION = 'knowledge_entries';
-const SEMANTIC_THRESHOLD = 0.85;
+// all-MiniLM-L6-v2 cosine scores for true paraphrases (esp. noisy live-transcript
+// phrasing like "so um can you tell me what you understand by the event loop")
+// land around 0.67-0.86, while genuinely different questions top out ~0.59.
+// 0.85 was rejecting most real paraphrases; 0.72 keeps a solid margin above the
+// closest confusable pair we measured (~0.59) while catching real paraphrases.
+const SEMANTIC_THRESHOLD = Number(process.env.SEMANTIC_THRESHOLD || 0.72);
 
 function normalizeQuestion(text) {
   return text

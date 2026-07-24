@@ -15,7 +15,12 @@ const PORT = process.env.PORT || 8787;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const DG_ENDPOINTING_MS = Number(process.env.DG_ENDPOINTING_MS || 900);
-const UTTERANCE_SILENCE_MS = Number(process.env.UTTERANCE_SILENCE_MS || 900);
+// Two-tier silence debounce: finalize quickly once the utterance sounds
+// complete, but keep waiting through longer pauses when it trails off
+// mid-clause — slow speakers / frequent pauses shouldn't get cut into
+// fragments and answered piecemeal.
+const UTTERANCE_SILENCE_MS = Number(process.env.UTTERANCE_SILENCE_MS || 1100);
+const UTTERANCE_MAX_PAUSE_MS = Number(process.env.UTTERANCE_MAX_PAUSE_MS || 3000);
 const MIN_UTTERANCE_CHARS = Number(process.env.MIN_UTTERANCE_CHARS || 12);
 
 if (!DEEPGRAM_API_KEY) throw new Error('Missing DEEPGRAM_API_KEY in backend/.env');
@@ -58,6 +63,32 @@ async function resolveAnswer(question) {
   const answer = await generateAnswer(question);
   await saveAnswer(question, answer);
   return { answer, source: 'model' };
+}
+
+// Heuristic: does the buffered text trail off mid-clause (ends on a
+// conjunction/preposition/article/auxiliary verb/filler) rather than a
+// natural stop? Used to decide whether a pause is "thinking mid-sentence"
+// (wait longer) vs. "done talking" (finalize soon).
+const MID_CLAUSE_TRAILING_WORDS = new Set([
+  'a', 'an', 'the', 'to', 'of', 'and', 'or', 'but', 'so', 'is', 'are', 'was',
+  'were', 'do', 'does', 'did', 'can', 'could', 'would', 'should', 'will',
+  'that', 'which', 'who', 'what', 'how', 'why', 'because', 'if', 'when',
+  'for', 'with', 'about', 'like', 'in', 'on', 'at', 'as', 'by', 'from', 'i',
+  'we', 'you', 'it', 'my', 'your', 'um', 'uh', 'uhh', 'umm',
+]);
+
+const MIN_COMPLETE_WORDS = 4;
+
+function looksMidClause(text) {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  if (/[?.!]$/.test(t)) return false;
+  const words = t.split(/\s+/).filter(Boolean);
+  // Unpunctuated and still short (e.g. "can you explain") — too early to
+  // tell if it's a real complete question, so keep waiting.
+  if (words.length < MIN_COMPLETE_WORDS) return true;
+  const lastWord = words[words.length - 1].toLowerCase().replace(/[^\w']/g, '');
+  return MID_CLAUSE_TRAILING_WORDS.has(lastWord);
 }
 
 function looksLikeAQuestion(text) {
@@ -159,6 +190,7 @@ wss.on('connection', (clientSocket) => {
 
   const enqueueFinalize = () => {
     clearFinalizeTimer();
+    const delay = looksMidClause(finalBuffer) ? UTTERANCE_MAX_PAUSE_MS : UTTERANCE_SILENCE_MS;
     finalizeTimer = setTimeout(async () => {
       finalizeTimer = null;
       const question = finalBuffer.trim();
@@ -183,7 +215,7 @@ wss.on('connection', (clientSocket) => {
       } finally {
         answerInFlight = false;
       }
-    }, UTTERANCE_SILENCE_MS);
+    }, delay);
   };
 
   const dgConnection = deepgram.listen.live({

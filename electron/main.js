@@ -57,7 +57,7 @@ ipcMain.handle('move-window', (_event, deltaX, deltaY) => {
   return mainWindow.getPosition();
 });
 
-ipcMain.handle('capture-screen', async () => {
+ipcMain.handle('capture-screen', async (_event, options = {}) => {
   // On macOS, check screen recording permission before attempting capture
   if (process.platform === 'darwin') {
     const status = systemPreferences.getMediaAccessStatus('screen');
@@ -68,9 +68,12 @@ ipcMain.handle('capture-screen', async () => {
     }
   }
 
+  const width = Number(options?.width) || 1920;
+  const height = Number(options?.height) || 1080;
+
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: { width: 1920, height: 1080 },
+    thumbnailSize: { width, height },
   });
   const primary = sources[0];
   if (!primary) throw new Error('No screen source found');
