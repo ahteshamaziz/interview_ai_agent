@@ -6,6 +6,23 @@ import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 const WS_URL = window.appConfig?.backendWsUrl ?? 'ws://localhost:8787/ws';
 const BACKEND_HTTP_URL = WS_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
 
+const IS_MAC = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || '');
+const MOD = IS_MAC ? '⌘' : 'Ctrl+';
+const SHIFT = IS_MAC ? '⇧' : 'Shift+';
+
+const SHORTCUTS = {
+  listen: `${MOD}L`,
+  focus: `${MOD}K`,
+  capture: `${MOD}P`,
+  autoDetect: `${MOD}${SHIFT}A`,
+  clear: `${MOD}${SHIFT}X`,
+  send: '↵',
+};
+
+function Kbd({ children }) {
+  return <span className="kbd">{children}</span>;
+}
+
 // Auto-detect tuning: poll a cheap low-res thumbnail, only pay for a full
 // capture + analysis once the screen has held still for a couple of polls.
 const AUTO_DETECT_POLL_MS = 2000;
@@ -294,6 +311,100 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [isListening, stealthAvailable, stealthEnabled]);
 
+  function handleWsPayload(payload) {
+    if (payload.type === 'status') {
+      setStatusMessage(payload.message);
+      return;
+    }
+    if (payload.type === 'transcript') {
+      setTranscript(payload.text);
+      return;
+    }
+    if (payload.type === 'answer-start') {
+      setStatusMessage('answering…');
+      setQaLog((prev) => [
+        ...prev,
+        {
+          question: payload.question,
+          answer: '',
+          source: 'model',
+          streaming: true,
+        },
+      ]);
+      setTranscript('');
+      return;
+    }
+    if (payload.type === 'answer-delta') {
+      setQaLog((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].question === payload.question && next[i].streaming) {
+            next[i] = { ...next[i], answer: next[i].answer + payload.delta };
+            break;
+          }
+        }
+        return next;
+      });
+      return;
+    }
+    if (payload.type === 'answer-done') {
+      setStatusMessage('answered');
+      setQaLog((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].question === payload.question && next[i].streaming) {
+            next[i] = {
+              ...next[i],
+              answer: payload.answer || next[i].answer,
+              source: payload.source,
+              matchType: payload.matchType,
+              matchedQuestion: payload.matchedQuestion,
+              streaming: false,
+            };
+            break;
+          }
+        }
+        return next;
+      });
+      return;
+    }
+    if (payload.type === 'answer') {
+      setStatusMessage('answered');
+      setQaLog((prev) => {
+        const next = [...prev];
+        // Replace streaming placeholder if we already opened one for a cache hit.
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].question === payload.question && next[i].streaming) {
+            next[i] = {
+              question: payload.question,
+              answer: payload.answer,
+              source: payload.source,
+              matchType: payload.matchType,
+              matchedQuestion: payload.matchedQuestion,
+              streaming: false,
+            };
+            return next;
+          }
+        }
+        return [
+          ...prev,
+          {
+            question: payload.question,
+            answer: payload.answer,
+            source: payload.source,
+            matchType: payload.matchType,
+            matchedQuestion: payload.matchedQuestion,
+          },
+        ];
+      });
+      setTranscript('');
+      return;
+    }
+    if (payload.type === 'error') {
+      setStatusMessage(payload.message);
+    }
+  }
+
   async function startListening() {
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
@@ -303,26 +414,7 @@ export default function App() {
     ws.onerror = () => setStatusMessage('error');
 
     ws.onmessage = (event) => {
-      const payload = JSON.parse(event.data);
-      if (payload.type === 'status') {
-        setStatusMessage(payload.message);
-      } else if (payload.type === 'transcript') {
-        setTranscript(payload.text);
-      } else if (payload.type === 'answer') {
-        setQaLog((prev) => [
-          ...prev,
-          {
-            question: payload.question,
-            answer: payload.answer,
-            source: payload.source,
-            matchType: payload.matchType,
-            matchedQuestion: payload.matchedQuestion,
-          },
-        ]);
-        setTranscript('');
-      } else if (payload.type === 'error') {
-        setStatusMessage(payload.message);
-      }
+      handleWsPayload(JSON.parse(event.data));
     };
 
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -379,49 +471,37 @@ export default function App() {
   async function sendTextQuestion() {
     const trimmedText = textInput.trim();
     if (!trimmedText) return;
-    
+
     setIsSendingText(true);
     setTextInput('');
-    
+
     // If audio WebSocket is open, use it
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ type: 'text-question', text: trimmedText }));
       setIsSendingText(false);
       return;
     }
-    
+
     // Otherwise create a temporary connection just for this text question
     const tempWs = new WebSocket(WS_URL);
-    
+
     tempWs.onopen = () => {
       tempWs.send(JSON.stringify({ type: 'text-question', text: trimmedText }));
     };
-    
+
     tempWs.onmessage = (event) => {
       const payload = JSON.parse(event.data);
-      if (payload.type === 'answer') {
-        setQaLog((prev) => [
-          ...prev,
-          {
-            question: payload.question,
-            answer: payload.answer,
-            source: payload.source,
-            matchType: payload.matchType,
-            matchedQuestion: payload.matchedQuestion,
-          },
-        ]);
-        tempWs.close();
-      } else if (payload.type === 'error') {
-        setStatusMessage(payload.message);
+      handleWsPayload(payload);
+      if (payload.type === 'answer' || payload.type === 'answer-done' || payload.type === 'error') {
         tempWs.close();
       }
     };
-    
+
     tempWs.onerror = () => {
       setStatusMessage('connection error');
       setIsSendingText(false);
     };
-    
+
     tempWs.onclose = () => {
       setIsSendingText(false);
     };
@@ -482,9 +562,13 @@ export default function App() {
         </select>
 
         {!isListening ? (
-          <button onClick={startListening}>Start Listening</button>
+          <button onClick={startListening} title={`Start listening (${SHORTCUTS.listen})`}>
+            Start Listening <Kbd>{SHORTCUTS.listen}</Kbd>
+          </button>
         ) : (
-          <button onClick={stopListening}>Stop</button>
+          <button onClick={stopListening} title={`Stop listening (${SHORTCUTS.listen})`}>
+            Stop <Kbd>{SHORTCUTS.listen}</Kbd>
+          </button>
         )}
       </div>
 
@@ -509,21 +593,24 @@ export default function App() {
           className="screenshot-btn"
           onClick={captureAndAnalyzeScreen}
           disabled={isCapturing}
-          title="Capture screen (Ctrl/Cmd+P)"
+          title={`Capture screen (${SHORTCUTS.capture})`}
         >
-          {isCapturing ? 'Capturing…' : 'Capture Screen'}
+          {isCapturing ? 'Capturing…' : 'Capture Screen'} <Kbd>{SHORTCUTS.capture}</Kbd>
         </button>
         <button
           className={`auto-detect-btn ${autoDetectEnabled ? 'auto-detect-on' : ''}`}
           onClick={toggleAutoDetect}
-          title="Watch the screen and auto-answer when a new question appears (Ctrl/Cmd+Shift+A)"
+          title={`Auto-detect questions on screen (${SHORTCUTS.autoDetect})`}
         >
-          {autoDetectEnabled ? `Auto-Detect: ${autoDetectStatus}` : 'Auto-Detect: OFF'}
+          {autoDetectEnabled ? `Auto-Detect: ${autoDetectStatus}` : 'Auto-Detect: OFF'}{' '}
+          <Kbd>{SHORTCUTS.autoDetect}</Kbd>
         </button>
       </div>
 
       <div className="text-input-section">
-        <div className="text-input-label">Type question if audio is unclear:</div>
+        <div className="text-input-label">
+          Type question if audio is unclear <Kbd>{SHORTCUTS.focus}</Kbd>
+        </div>
         <div className="text-input-row">
           <textarea
             className="text-input"
@@ -539,9 +626,13 @@ export default function App() {
             className="send-btn"
             onClick={sendTextQuestion}
             disabled={!textInput.trim() || isSendingText}
-            title="Send question to get answer"
+            title={`Send question (${SHORTCUTS.send})`}
           >
-            {isSendingText ? '...' : 'Send'}
+            {isSendingText ? '...' : (
+              <>
+                Send <Kbd>{SHORTCUTS.send}</Kbd>
+              </>
+            )}
           </button>
         </div>
       </div>
@@ -554,11 +645,13 @@ export default function App() {
             <div key={i} className="qa-item">
               <div className="question">
                 Q: {qa.question}
-                {qa.source && (
+                {qa.streaming ? (
+                  <span className="source-badge source-streaming">streaming</span>
+                ) : qa.source ? (
                   <span className={`source-badge ${qa.source === 'cache' ? 'source-cache' : 'source-model'}`}>
                     {qa.source === 'cache' ? 'memory' : 'model'}
                   </span>
-                )}
+                ) : null}
               </div>
               <div className="answer">
                 <ReactMarkdown

@@ -1,0 +1,630 @@
+<style>
+@font-face {
+  font-family: "Plex Mono";
+  font-weight: 400;
+  font-style: normal;
+  src: url(data:font/woff2;base64,__MONO400__) format("woff2");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Mono";
+  font-weight: 500;
+  font-style: normal;
+  src: url(data:font/woff2;base64,__MONO500__) format("woff2");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Mono";
+  font-weight: 600;
+  font-style: normal;
+  src: url(data:font/woff2;base64,__MONO600__) format("woff2");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Serif";
+  font-weight: 400;
+  font-style: normal;
+  src: url(data:font/woff2;base64,__SERIF400__) format("woff2");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Serif";
+  font-weight: 400;
+  font-style: italic;
+  src: url(data:font/woff2;base64,__SERIF400I__) format("woff2");
+  font-display: swap;
+}
+@font-face {
+  font-family: "Plex Serif";
+  font-weight: 600;
+  font-style: normal;
+  src: url(data:font/woff2;base64,__SERIF600__) format("woff2");
+  font-display: swap;
+}
+
+:root {
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --surface-2: #f7f9fb;
+  --ink: #141b26;
+  --ink-muted: #4b5768;
+  --ink-faint: #7c8798;
+  --line: #ccd5e0;
+  --line-strong: #a9b6c6;
+  --accent: #2358a6;
+  --accent-ink: #163d75;
+  --accent-soft: #dce7f5;
+  --warn: #a3541e;
+  --warn-soft: #f4e3d0;
+  --good: #2e7d5b;
+  --good-soft: #dceee4;
+  --shadow: 0 1px 2px rgba(20, 27, 38, 0.06), 0 8px 24px rgba(20, 27, 38, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f141c;
+    --surface: #161d28;
+    --surface-2: #131922;
+    --ink: #e8ecf3;
+    --ink-muted: #9aa7ba;
+    --ink-faint: #6c7789;
+    --line: #2b3646;
+    --line-strong: #3c4a5e;
+    --accent: #74a9ea;
+    --accent-ink: #bcd6f7;
+    --accent-soft: #1c2c42;
+    --warn: #dfa15b;
+    --warn-soft: #2f2314;
+    --good: #6bc79a;
+    --good-soft: #142720;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 28px rgba(0, 0, 0, 0.35);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f141c;
+  --surface: #161d28;
+  --surface-2: #131922;
+  --ink: #e8ecf3;
+  --ink-muted: #9aa7ba;
+  --ink-faint: #6c7789;
+  --line: #2b3646;
+  --line-strong: #3c4a5e;
+  --accent: #74a9ea;
+  --accent-ink: #bcd6f7;
+  --accent-soft: #1c2c42;
+  --warn: #dfa15b;
+  --warn-soft: #2f2314;
+  --good: #6bc79a;
+  --good-soft: #142720;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 28px rgba(0, 0, 0, 0.35);
+}
+:root[data-theme="light"] {
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --surface-2: #f7f9fb;
+  --ink: #141b26;
+  --ink-muted: #4b5768;
+  --ink-faint: #7c8798;
+  --line: #ccd5e0;
+  --line-strong: #a9b6c6;
+  --accent: #2358a6;
+  --accent-ink: #163d75;
+  --accent-soft: #dce7f5;
+  --warn: #a3541e;
+  --warn-soft: #f4e3d0;
+  --good: #2e7d5b;
+  --good-soft: #dceee4;
+  --shadow: 0 1px 2px rgba(20, 27, 38, 0.06), 0 8px 24px rgba(20, 27, 38, 0.05);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Plex Serif", Georgia, serif;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent-soft); color: var(--accent-ink); }
+
+.mono {
+  font-family: "Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+.eyebrow {
+  font-family: "Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+a { color: var(--accent); }
+
+.page {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 56px 28px 96px;
+}
+
+/* ---------- Masthead ---------- */
+.masthead {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 28px;
+  margin-bottom: 40px;
+}
+.masthead h1 {
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: clamp(28px, 4.4vw, 40px);
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  margin: 10px 0 14px;
+  text-wrap: balance;
+  color: var(--ink);
+}
+.masthead .dek {
+  font-size: 17px;
+  color: var(--ink-muted);
+  max-width: 62ch;
+  margin: 0 0 20px;
+}
+.meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  font-family: "Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+.meta-row span b { color: var(--ink-muted); font-weight: 500; }
+
+/* ---------- Sections ---------- */
+section { margin: 52px 0; }
+section > .eyebrow { display: block; margin-bottom: 8px; }
+h2 {
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: 21px;
+  letter-spacing: -0.005em;
+  margin: 0 0 16px;
+  color: var(--ink);
+  text-wrap: balance;
+}
+p { margin: 0 0 14px; color: var(--ink); max-width: 68ch; }
+p.muted { color: var(--ink-muted); }
+.lede { font-size: 17.5px; }
+
+/* ---------- Decision card ---------- */
+.decision {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+  padding: 22px 24px;
+  box-shadow: var(--shadow);
+}
+.decision .verdict {
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--accent-ink);
+  margin: 2px 0 12px;
+}
+.decision .grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--line);
+}
+.decision .grid-2 h4 {
+  font-family: "Plex Mono", monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 8px;
+  font-weight: 500;
+}
+.decision .grid-2 p { font-size: 14.5px; margin: 0; color: var(--ink-muted); }
+@media (max-width: 620px) {
+  .decision .grid-2 { grid-template-columns: 1fr; }
+}
+
+/* ---------- Diagram ---------- */
+.diagram-wrap {
+  margin-left: calc(50% - 50vw);
+  margin-right: calc(50% - 50vw);
+  padding: 40px calc(50vw - 50% + 20px);
+  background: var(--surface-2);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.diagram {
+  max-width: 900px;
+  margin: 0 auto;
+  overflow-x: auto;
+}
+.tier { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+.node {
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  padding: 14px 16px;
+  min-width: 190px;
+  flex: 1 1 190px;
+  max-width: 260px;
+  box-shadow: var(--shadow);
+}
+.node .label {
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--ink);
+  margin-bottom: 4px;
+}
+.node .sub {
+  font-family: "Plex Mono", monospace;
+  font-size: 11px;
+  color: var(--ink-faint);
+  line-height: 1.5;
+}
+.node.accent { border-color: var(--accent); }
+.node.accent .label { color: var(--accent-ink); }
+.node.wide { max-width: 620px; flex: 1 1 100%; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip {
+  font-family: "Plex Mono", monospace;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border: 1px solid transparent;
+}
+.chip.dim {
+  background: var(--surface-2);
+  color: var(--ink-faint);
+  border-color: var(--line);
+}
+.connector {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+}
+.connector .line { width: 1px; height: 22px; background: var(--line-strong); }
+.connector .tag {
+  font-family: "Plex Mono", monospace;
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  background: var(--surface-2);
+  padding: 1px 8px;
+  margin: 2px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.connector .arrow {
+  width: 0; height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--line-strong);
+}
+.fork { display: flex; gap: 60px; }
+.fork .connector { padding: 8px 0 0; }
+
+/* ---------- Table ---------- */
+.table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); box-shadow: var(--shadow); }
+table { border-collapse: collapse; width: 100%; min-width: 640px; }
+th, td { text-align: left; padding: 12px 14px; font-size: 14.5px; vertical-align: top; }
+thead th {
+  font-family: "Plex Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  font-weight: 500;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+tbody tr + tr td { border-top: 1px solid var(--line); }
+td.component { font-family: "Plex Mono", monospace; font-weight: 500; font-size: 13.5px; color: var(--ink); white-space: nowrap; }
+td .pick {
+  display: inline-block;
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--good);
+  background: var(--good-soft);
+  padding: 1px 7px;
+  border-radius: 3px;
+  margin-bottom: 4px;
+}
+td .why { color: var(--ink-muted); font-size: 13.5px; }
+td .alt { color: var(--ink-faint); font-size: 12.5px; margin-top: 4px; }
+
+/* ---------- Non-negotiables ---------- */
+.callout {
+  background: var(--warn-soft);
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--line));
+  border-left: 3px solid var(--warn);
+  border-radius: 3px;
+  padding: 20px 24px 6px;
+}
+.callout h2 { color: var(--warn); }
+.rule {
+  display: grid;
+  grid-template-columns: 168px 1fr;
+  gap: 4px 18px;
+  padding: 12px 0;
+  border-top: 1px dashed color-mix(in srgb, var(--warn) 30%, var(--line));
+}
+.rule:first-of-type { border-top: none; }
+.rule dt {
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: 13.5px;
+  color: var(--warn);
+}
+.rule dd { margin: 0; font-size: 14.5px; color: var(--ink); }
+@media (max-width: 560px) {
+  .rule { grid-template-columns: 1fr; }
+}
+
+/* ---------- Roadmap ---------- */
+.roadmap { position: relative; padding-left: 30px; }
+.roadmap::before {
+  content: "";
+  position: absolute;
+  left: 9px; top: 6px; bottom: 6px;
+  width: 1px;
+  background: var(--line-strong);
+}
+.phase { position: relative; padding-bottom: 30px; }
+.phase:last-child { padding-bottom: 0; }
+.phase::before {
+  content: "";
+  position: absolute;
+  left: -30px; top: 3px;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--surface);
+  border: 2px solid var(--accent);
+}
+.phase .ph-label {
+  font-family: "Plex Mono", monospace;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.phase h3 {
+  font-family: "Plex Mono", monospace;
+  font-size: 16px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  color: var(--ink);
+}
+.phase p { font-size: 14.5px; color: var(--ink-muted); margin: 0; }
+.phase .deliv {
+  margin-top: 8px;
+  font-family: "Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* ---------- Close ---------- */
+.close {
+  margin-top: 60px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+  font-size: 14.5px;
+  color: var(--ink-muted);
+}
+</style>
+
+<div class="page">
+
+  <div class="masthead">
+    <span class="eyebrow">Architecture note — Interview AI</span>
+    <h1>From single-purpose copilot to a modular career platform</h1>
+    <p class="dek">A production path for splitting the backend from the Electron shell, hosting it centrally, and adding resume &amp; job-hunting tools without a rewrite.</p>
+    <div class="meta-row">
+      <span><b>Prepared</b> 24 Jul 2026</span>
+      <span><b>Scope</b> backend extraction · hosting · desktop distribution · new tool modules</span>
+      <span><b>Status</b> proposal — awaiting go-ahead on Phase&nbsp;1</span>
+    </div>
+  </div>
+
+  <section>
+    <span class="eyebrow">Where this stands today</span>
+    <h2>One Electron app, one backend, one machine</h2>
+    <p class="lede">Right now the whole thing only works because everything lives on your laptop: the Electron shell talks to <code class="mono">ws://localhost:8787</code> by name, the knowledge-base cache sits in a local MongoDB, screenshots land on local disk, and the Anthropic/Deepgram keys live in a <code class="mono">backend/.env</code> file next to the code that uses them.</p>
+    <p class="muted">That's the right shape for one tool on one machine. It stops being the right shape the moment you want a second machine, a second tool, or a second person using it — which is what you're asking for.</p>
+  </section>
+
+  <section>
+    <span class="eyebrow">Decision</span>
+    <div class="decision">
+      <div class="verdict">Modular monolith now — not literal microservices.</div>
+      <p>One backend deployment, organized as independent domain modules (<code class="mono">auth</code>, <code class="mono">interview</code>, <code class="mono">resume</code>, <code class="mono">jobs</code>) that share one process, one datastore connection pool, and one set of infra clients. Each module owns its routes and its data; none reach into another's internals.</p>
+      <div class="grid-2">
+        <div>
+          <h4>Why not real microservices yet</h4>
+          <p>You're one developer shipping four features. Separate services mean separate deploys, separate health checks, network calls where function calls used to be, and distributed-systems failure modes — paid for before you have the traffic or team size that justifies it.</p>
+        </div>
+        <div>
+          <h4>Reconsider when</h4>
+          <p>A specific module needs to scale, deploy, or fail independently of the others — e.g. resume PDF generation is CPU-heavy and blocking the interview WebSocket. Clean module boundaries now make that a lift-and-shift later, not a rewrite.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="diagram-wrap">
+    <div class="diagram">
+      <div class="tier">
+        <div class="node">
+          <div class="label">Electron desktop</div>
+          <div class="sub">interview copilot · mic capture<br>screen capture · stealth overlay</div>
+        </div>
+        <div class="node">
+          <div class="label">React web app</div>
+          <div class="sub">resume ATS score · resume builder<br>job hunting</div>
+        </div>
+      </div>
+
+      <div class="connector">
+        <div class="line"></div>
+        <div class="tag">HTTPS + WSS</div>
+        <div class="arrow"></div>
+      </div>
+
+      <div class="tier">
+        <div class="node accent wide">
+          <div class="label">Backend API — modular monolith (Node / Express)</div>
+          <div class="chips">
+            <span class="chip">auth</span>
+            <span class="chip">interview</span>
+            <span class="chip">resume</span>
+            <span class="chip">jobs</span>
+          </div>
+          <div class="chips">
+            <span class="chip dim">llm client</span>
+            <span class="chip dim">embeddings</span>
+            <span class="chip dim">storage client</span>
+            <span class="chip dim">rate limiter</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="fork">
+        <div class="connector">
+          <div class="line"></div>
+          <div class="arrow"></div>
+        </div>
+        <div class="connector">
+          <div class="line"></div>
+          <div class="arrow"></div>
+        </div>
+      </div>
+
+      <div class="tier">
+        <div class="node">
+          <div class="label">Data layer</div>
+          <div class="sub">MongoDB Atlas — accounts, KB cache,<br>resumes, saved jobs<br><br>Object storage (R2 / S3) — screenshots,<br>uploaded &amp; generated resumes</div>
+        </div>
+        <div class="node">
+          <div class="label">External APIs</div>
+          <div class="sub">Anthropic — answer generation,<br>screenshot &amp; ATS analysis<br><br>Deepgram — live speech-to-text</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <section>
+    <span class="eyebrow">Deployment</span>
+    <h2>Where each piece runs</h2>
+    <p class="muted">Picks are biased toward what a solo developer can operate without a platform team — long-lived WebSocket support was the main filter, since the live-transcription feature rules out pure request/response serverless for the backend.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Component</th><th>Recommendation</th><th>Alternative</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="component">Backend API + WS</td>
+            <td><span class="pick">Railway</span><div class="why">Deploys straight from the repo, holds WebSocket connections open, env vars &amp; logs in one place. Fly.io is the runner-up if you later want multi-region.</div></td>
+            <td class="alt">Render · Fly.io · DO App Platform</td>
+          </tr>
+          <tr>
+            <td class="component">Database</td>
+            <td><span class="pick">MongoDB Atlas</span><div class="why">Same driver you already use — swap <code class="mono">MONGODB_URI</code>, no code change. Free tier covers early usage.</div></td>
+            <td class="alt">Self-hosted Mongo on the same host</td>
+          </tr>
+          <tr>
+            <td class="component">File storage</td>
+            <td><span class="pick">Cloudflare R2</span><div class="why">S3-compatible API, no egress fees — matters once screenshots and generated resume PDFs are per-user instead of a local folder.</div></td>
+            <td class="alt">AWS S3 · Supabase Storage</td>
+          </tr>
+          <tr>
+            <td class="component">React web app</td>
+            <td><span class="pick">Vercel</span><div class="why">Git-push deploys for a static Vite/React build, generous free tier, instant preview URLs per branch.</div></td>
+            <td class="alt">Netlify · Cloudflare Pages</td>
+          </tr>
+          <tr>
+            <td class="component">Desktop distribution</td>
+            <td><span class="pick">electron-builder + GitHub Releases</span><div class="why">Builds signed macOS/Windows installers and wires up <code class="mono">electron-updater</code> for auto-update, publishing straight to release assets.</div></td>
+            <td class="alt">electron-builder → S3/R2 bucket</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="callout">
+    <span class="eyebrow" style="color: var(--warn)">Before you host this publicly</span>
+    <h2>Four things that are optional on localhost and mandatory in production</h2>
+    <dl>
+      <div class="rule">
+        <dt>Auth + rate limits</dt>
+        <dd>Today, "only you can reach it" is the entire access control model. A hosted URL with no auth in front of it means anyone who finds it can burn your Anthropic and Deepgram quota. This has to land before or alongside the first deploy, not after.</dd>
+      </div>
+      <div class="rule">
+        <dt>Secrets off disk</dt>
+        <dd><code class="mono">backend/.env</code> stays local-only. On the host, keys live in its secret manager (Railway/Fly/Render all have one) — never in the repo, never in a client bundle.</dd>
+      </div>
+      <div class="rule">
+        <dt>TLS everywhere</dt>
+        <dd><code class="mono">ws://localhost:8787</code> becomes <code class="mono">wss://api.yourdomain.com</code>. Electron's <code class="mono">backendWsUrl</code> needs to be a build-time/config value, not a hardcoded constant.</dd>
+      </div>
+      <div class="rule">
+        <dt>CORS allowlist</dt>
+        <dd>Once the React web app calls the API directly from a browser, lock <code class="mono">cors()</code> down to your actual origins instead of the open default.</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section>
+    <span class="eyebrow">Sequencing</span>
+    <h2>Roadmap</h2>
+    <div class="roadmap">
+      <div class="phase">
+        <div class="ph-label">Phase 1 — Extract &amp; configure</div>
+        <h3>Backend becomes host-agnostic</h3>
+        <p>Split routes into domain routers under <code class="mono">/api/v1/interview/*</code>, move the WS URL and API base into Electron config instead of the hardcoded constant in <code class="mono">preload.js</code>, add a Dockerfile and health check. No new features — this is what makes every later step possible.</p>
+        <div class="deliv">touches: backend/src/*, electron/preload.js, electron/main.js</div>
+      </div>
+      <div class="phase">
+        <div class="ph-label">Phase 2 — Ship it somewhere real</div>
+        <h3>Deploy + lock the door</h3>
+        <p>Stand up Railway + Atlas + R2, add auth and per-user rate limiting, point Electron at the hosted URL. This is the phase that turns "runs on my machine" into "runs for anyone."</p>
+        <div class="deliv">new: auth module, rate limiter, storage client</div>
+      </div>
+      <div class="phase">
+        <div class="ph-label">Phase 3 — Package for other machines</div>
+        <h3>Signed, auto-updating builds</h3>
+        <p>Wire up <code class="mono">electron-builder</code> for macOS/Windows installers, code signing, and <code class="mono">electron-updater</code> so new machines just install once and stay current.</p>
+        <div class="deliv">new: electron-builder config, CI build workflow</div>
+      </div>
+      <div class="phase">
+        <div class="ph-label">Phase 4 — New tools</div>
+        <h3>Resume ATS score, resume builder, job hunting</h3>
+        <p>Each ships as a new domain module behind the same auth and shared LLM/storage kernel — plus the React web app to use them from, since none need Electron's screen-capture access.</p>
+        <div class="deliv">new: resume module, jobs module, apps/web</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="close">
+    Say where to start and I'll turn Phase&nbsp;1 into an implementation plan — that's the one with no user-facing risk and it unblocks everything after it.
+  </div>
+
+</div>

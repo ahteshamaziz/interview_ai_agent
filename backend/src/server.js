@@ -9,7 +9,7 @@ const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
 const Anthropic = require('@anthropic-ai/sdk');
 const { connectDb } = require('./db');
 const { initEmbeddings } = require('./embeddings');
-const { lookupAnswer, saveAnswer, backfillEmbeddings } = require('./knowledgeBase');
+const { lookupAnswer, lookupExactAnswer, saveAnswer, backfillEmbeddings } = require('./knowledgeBase');
 
 const PORT = process.env.PORT || 8787;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
@@ -29,28 +29,60 @@ if (!ANTHROPIC_API_KEY) throw new Error('Missing ANTHROPIC_API_KEY in backend/.e
 const deepgram = createClient(DEEPGRAM_API_KEY);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
-const SYSTEM_PROMPT = `You are a calm, sharp interview co-pilot. You receive a live transcript fragment of
-a question being asked in a job interview. Reply with a concise, well-structured suggested answer
-the candidate could say out loud. Keep it under 500 words, use plain spoken language, and skip any
-preamble like "Sure" or "Here's an answer" — just give the answer content itself. Give answer in bullet and examples If It is technical give some code examples.`;
+// Balanced: detailed enough for interviews, short enough for Haiku to stay fast.
+const SYSTEM_PROMPT = `You are a sharp interview co-pilot. Give a clear spoken answer the candidate can use.
+No preamble ("Sure", "Here's an answer") — answer content only.
 
-async function generateAnswer(transcriptText) {
-  const message = await anthropic.messages.create({
-    model: 'claude-sonnet-4-6',
-    max_tokens: 400,
+Target ~200–350 words. Be useful, not an essay.
+
+IMPORTANT: For every coding / technical question, write all code examples in JavaScript only
+(Node.js-style when backend context fits). Do not use Python, Java, C++, TypeScript-only syntax,
+or other languages unless the question explicitly asks for that language.
+
+Structure:
+1. Direct answer (1–2 sentences)
+2. Key points as bullets (4–6 bullets)
+3. One short real-world / spoken example
+4. If technical: a small JavaScript code snippet (≤15 lines) + 1–2 trade-offs
+5. 2 likely follow-up questions with one-line replies
+
+Prefer bullets. Skip fluff.`;
+
+const ANSWER_MODEL = process.env.ANSWER_MODEL || 'claude-haiku-4-5-20251001';
+const EXTRACT_MODEL = process.env.EXTRACT_MODEL || 'claude-haiku-4-5-20251001';
+const ANSWER_MAX_TOKENS = Number(process.env.ANSWER_MAX_TOKENS || 900);
+
+async function generateAnswer(transcriptText, onDelta) {
+  const t0 = Date.now();
+  const stream = anthropic.messages.stream({
+    model: ANSWER_MODEL,
+    max_tokens: ANSWER_MAX_TOKENS,
     system: SYSTEM_PROMPT,
     messages: [{ role: 'user', content: transcriptText }],
   });
-  return message.content
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('');
+
+  let full = '';
+  let firstTokenAt = null;
+  stream.on('text', (text) => {
+    if (firstTokenAt == null) {
+      firstTokenAt = Date.now();
+      console.log(`[claude] first token in ${firstTokenAt - t0}ms`);
+    }
+    full += text;
+    if (onDelta) onDelta(text);
+  });
+
+  await stream.finalMessage();
+  console.log(`[claude] complete in ${Date.now() - t0}ms (${full.length} chars)`);
+  return full;
 }
 
-async function resolveAnswer(question) {
-  const cached = await lookupAnswer(question);
+async function resolveAnswer(question, onDelta) {
+  const t0 = Date.now();
+  // Exact-only on the hot path — embedding semantic search is too slow for 1–2s.
+  const cached = await lookupExactAnswer(question);
   if (cached) {
-    console.log(`[kb] cache hit (${cached.matchType}): "${question}"`);
+    console.log(`[kb] cache hit (${cached.matchType}) in ${Date.now() - t0}ms: "${question}"`);
     return {
       answer: cached.answer,
       source: 'cache',
@@ -60,9 +92,26 @@ async function resolveAnswer(question) {
   }
 
   console.log(`[kb] cache miss, calling model: "${question}"`);
-  const answer = await generateAnswer(question);
-  await saveAnswer(question, answer);
+  const answer = await generateAnswer(question, onDelta);
+  saveAnswer(question, answer).catch((err) =>
+    console.warn('[kb] background save failed:', err.message),
+  );
+  console.log(`[resolve] model answer ready in ${Date.now() - t0}ms`);
   return { answer, source: 'model' };
+}
+
+async function warmModel() {
+  try {
+    const t0 = Date.now();
+    await anthropic.messages.create({
+      model: ANSWER_MODEL,
+      max_tokens: 8,
+      messages: [{ role: 'user', content: 'ping' }],
+    });
+    console.log(`[claude] warm-up ok in ${Date.now() - t0}ms (${ANSWER_MODEL})`);
+  } catch (err) {
+    console.warn('[claude] warm-up failed:', err.message);
+  }
 }
 
 // Heuristic: does the buffered text trail off mid-clause (ends on a
@@ -128,27 +177,48 @@ app.post('/analyze-screenshot', async (req, res) => {
   const { imageBase64 } = req.body;
   if (!imageBase64) return res.status(400).json({ error: 'No image provided' });
 
+  const t0 = Date.now();
   try {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const filename = `screenshot-${timestamp}.png`;
     const filepath = path.join(SCREENSHOTS_DIR, filename);
-    fs.writeFileSync(filepath, Buffer.from(imageBase64, 'base64'));
-    console.log(`[screenshot] saved to ${filepath}`);
+    // Disk write off the critical path for the response.
+    fs.promises
+      .writeFile(filepath, Buffer.from(imageBase64, 'base64'))
+      .then(() => console.log(`[screenshot] saved to ${filepath}`))
+      .catch((err) => console.warn('[screenshot] save failed:', err.message));
 
-    // Step 1: extract the question text from the image
-    const extractMsg = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 300,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
-          { type: 'text', text: EXTRACT_QUESTION_PROMPT },
-        ],
-      }],
-    });
+    // Step 1: extract the question text (use a faster/cheaper model)
+    const extractT0 = Date.now();
+    let extractMsg;
+    try {
+      extractMsg = await anthropic.messages.create({
+        model: EXTRACT_MODEL,
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
+            { type: 'text', text: EXTRACT_QUESTION_PROMPT },
+          ],
+        }],
+      });
+    } catch (extractErr) {
+      console.warn(`[screenshot] extract model ${EXTRACT_MODEL} failed (${extractErr.message}), falling back to ${ANSWER_MODEL}`);
+      extractMsg = await anthropic.messages.create({
+        model: ANSWER_MODEL,
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
+            { type: 'text', text: EXTRACT_QUESTION_PROMPT },
+          ],
+        }],
+      });
+    }
     const extractedQuestion = extractMsg.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
-    console.log(`[screenshot] extracted question: "${extractedQuestion}"`);
+    console.log(`[screenshot] extract in ${Date.now() - extractT0}ms: "${extractedQuestion}"`);
 
     if (extractedQuestion === 'NONE') {
       return res.json({ answer: 'No interview or coding question was detected in the screenshot.', savedAs: filename, question: null, source: 'model' });
@@ -156,6 +226,7 @@ app.post('/analyze-screenshot', async (req, res) => {
 
     // Step 2: resolve through the same cache+KB pipeline as audio/text questions
     const result = await resolveAnswer(extractedQuestion);
+    console.log(`[screenshot] total ${Date.now() - t0}ms`);
     res.json({ ...result, savedAs: filename, question: extractedQuestion });
   } catch (err) {
     console.error('[screenshot] error:', err.message);
@@ -208,8 +279,27 @@ wss.on('connection', (clientSocket) => {
       lastAnswerAt = now;
 
       try {
-        const result = await resolveAnswer(question);
-        send({ type: 'answer', question, ...result });
+        const cached = await lookupExactAnswer(question);
+        if (cached) {
+          console.log(`[kb] cache hit (${cached.matchType}): "${question}"`);
+          send({
+            type: 'answer',
+            question,
+            answer: cached.answer,
+            source: 'cache',
+            matchType: cached.matchType,
+            matchedQuestion: cached.matchedQuestion,
+          });
+        } else {
+          send({ type: 'answer-start', question });
+          const answer = await generateAnswer(question, (delta) => {
+            send({ type: 'answer-delta', question, delta });
+          });
+          saveAnswer(question, answer).catch((err) =>
+            console.warn('[kb] background save failed:', err.message),
+          );
+          send({ type: 'answer-done', question, answer, source: 'model' });
+        }
       } catch (err) {
         send({ type: 'error', message: `Answer error: ${err.message}` });
       } finally {
@@ -272,8 +362,27 @@ wss.on('connection', (clientSocket) => {
         if (message.type === 'text-question') {
           console.log('[ws] received text question:', message.text);
           try {
-            const result = await resolveAnswer(message.text);
-            send({ type: 'answer', question: message.text, ...result });
+            const cached = await lookupExactAnswer(message.text);
+            if (cached) {
+              console.log(`[kb] cache hit (${cached.matchType}): "${message.text}"`);
+              send({
+                type: 'answer',
+                question: message.text,
+                answer: cached.answer,
+                source: 'cache',
+                matchType: cached.matchType,
+                matchedQuestion: cached.matchedQuestion,
+              });
+            } else {
+              send({ type: 'answer-start', question: message.text });
+              const answer = await generateAnswer(message.text, (delta) => {
+                send({ type: 'answer-delta', question: message.text, delta });
+              });
+              saveAnswer(message.text, answer).catch((err) =>
+                console.warn('[kb] background save failed:', err.message),
+              );
+              send({ type: 'answer-done', question: message.text, answer, source: 'model' });
+            }
           } catch (err) {
             send({ type: 'error', message: `Answer error: ${err.message}` });
           }
@@ -304,6 +413,7 @@ wss.on('connection', (clientSocket) => {
 connectDb()
   .then(() => initEmbeddings())
   .then(() => backfillEmbeddings())
+  .then(() => warmModel())
   .then(() => {
     server.listen(PORT, () => {
       console.log(`Backend listening on http://localhost:${PORT} (ws path: /ws)`);

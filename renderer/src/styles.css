@@ -109,6 +109,31 @@ button {
   cursor: pointer;
   background: #2563eb;
   border: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  font-family: ui-monospace, 'SF Mono', Menlo, Monaco, Consolas, monospace;
+  color: rgba(230, 230, 230, 0.9);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  white-space: nowrap;
+}
+
+.text-input-label .kbd {
+  margin-left: 4px;
+  vertical-align: middle;
 }
 
 .mic-meter {
@@ -200,6 +225,9 @@ button {
   height: fit-content;
   background: #22c55e;
   font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .send-btn:disabled {
@@ -327,6 +355,12 @@ button {
   border: 1px solid rgba(59, 130, 246, 0.35);
 }
 
+.source-streaming {
+  background: rgba(251, 191, 36, 0.2);
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+}
+
 .screenshot-section {
   display: flex;
   gap: 8px;
@@ -343,6 +377,10 @@ button {
   font-size: 13px;
   font-weight: 500;
   transition: background 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .screenshot-btn:hover:not(:disabled) {
@@ -365,6 +403,10 @@ button {
   font-size: 13px;
   font-weight: 500;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
 }
 
 .auto-detect-btn:hover {
