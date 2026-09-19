@@ -245,6 +245,20 @@ export default function App() {
     };
   }, [autoDetectEnabled]);
 
+  async function clearQaHistory() {
+    setQaLog([]);
+    setStatusMessage('history-cleared');
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'clear-history' }));
+      return;
+    }
+    try {
+      await fetch(`${BACKEND_HTTP_URL}/clear-history`, { method: 'POST' });
+    } catch {
+      // Backend may be down; UI is still cleared.
+    }
+  }
+
   useEffect(() => {
     const onKeyDown = (e) => {
       // Avoid stealing keystrokes while typing (except explicit shortcuts).
@@ -303,7 +317,7 @@ export default function App() {
       if (e.shiftKey && key.toLowerCase() === 'x') {
         e.preventDefault();
         if (isTypingTarget) return;
-        setQaLog([]);
+        clearQaHistory();
       }
     };
 

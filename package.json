@@ -4,6 +4,7 @@
   "private": true,
   "main": "electron/main.js",
   "scripts": {
+    "dev": "bash scripts/dev.sh",
     "dev:renderer": "npm --prefix renderer run dev",
     "dev:backend": "npm --prefix backend run dev",
     "dev:electron": "env -u ELECTRON_RUN_AS_NODE electron .",

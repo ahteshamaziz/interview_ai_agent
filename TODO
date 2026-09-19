@@ -1,0 +1,10 @@
+- Create a feature for resume update and then extract the info related to project and when give answer try to use same contect.
+
+- When capturing the screen it is only captuing one question when have multipe question.
+  - after capture pull all question then after user select give answer of those.
+
+- Follow up question is not working properly give more context.
+
+- implement colpali
+
+- implement new vector db because rag is not working properly
