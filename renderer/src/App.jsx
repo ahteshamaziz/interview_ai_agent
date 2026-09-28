@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import SessionSetup from './SessionSetup.jsx';
 
 const WS_URL = window.appConfig?.backendWsUrl ?? 'ws://localhost:8787/ws';
 const BACKEND_HTTP_URL = WS_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
@@ -84,6 +85,8 @@ export default function App() {
   const [isCapturing, setIsCapturing] = useState(false);
   const [autoDetectEnabled, setAutoDetectEnabled] = useState(false);
   const [autoDetectStatus, setAutoDetectStatus] = useState('off');
+  const [session, setSession] = useState(null);
+  const [sessionReady, setSessionReady] = useState(false);
 
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
@@ -93,6 +96,38 @@ export default function App() {
   const levelLoopRef = useRef(null);
   const textareaRef = useRef(null);
   const autoDetectBusyRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${BACKEND_HTTP_URL}/session`)
+      .then((res) => res.json())
+      .then((payload) => {
+        if (!cancelled && payload?.profile) setSession(payload.profile);
+      })
+      .catch(() => {
+        // Backend may still be starting; stay on setup.
+      })
+      .finally(() => {
+        if (!cancelled) setSessionReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function endSession() {
+    if (isListening) stopListening();
+    setAutoDetectEnabled(false);
+    setQaLog([]);
+    setTranscript('');
+    try {
+      await fetch(`${BACKEND_HTTP_URL}/session/clear`, { method: 'POST' });
+    } catch {
+      // UI still returns to setup even if backend is down.
+    }
+    setSession(null);
+    setStatusMessage('idle');
+  }
 
   useEffect(() => {
     navigator.mediaDevices.enumerateDevices().then((deviceList) => {
@@ -283,6 +318,7 @@ export default function App() {
 
       // Shortcuts below require Ctrl/Cmd
       if (!ctrlOrCmd) return;
+      if (!session) return;
 
       // Ctrl/Cmd + L: start/stop listening
       if (key.toLowerCase() === 'l') {
@@ -323,7 +359,7 @@ export default function App() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [isListening, stealthAvailable, stealthEnabled]);
+  }, [isListening, stealthAvailable, stealthEnabled, session]);
 
   function handleWsPayload(payload) {
     if (payload.type === 'status') {
@@ -562,6 +598,29 @@ export default function App() {
         </div>
       </header>
 
+      {!sessionReady ? (
+        <div className="session-loading">Loading session…</div>
+      ) : !session ? (
+        <SessionSetup
+          backendUrl={BACKEND_HTTP_URL}
+          onStarted={(profile) => {
+            setSession(profile);
+            setStatusMessage('session-ready');
+          }}
+        />
+      ) : (
+        <>
+      <div className="session-banner">
+        <div className="session-banner-text">
+          <strong>{session.roleTitle}</strong>
+          {session.company ? ` · ${session.company}` : ''}
+          {session.primaryLanguage ? ` · ${session.primaryLanguage}` : ''}
+        </div>
+        <button type="button" className="session-new-btn" onClick={endSession} title="Start a new JD + resume session">
+          New
+        </button>
+      </div>
+
       <div className="controls">
         <select
           value={selectedDeviceId}
@@ -700,6 +759,8 @@ export default function App() {
             </div>
           ))}
       </div>
+        </>
+      )}
     </div>
   );
 }

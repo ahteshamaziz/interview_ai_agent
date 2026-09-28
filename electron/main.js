@@ -10,8 +10,8 @@ let contentProtectionEnabled = true;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 420,
-    height: 640,
+    width: 440,
+    height: 720,
     alwaysOnTop: true,
     frame: false,
     transparent: true,

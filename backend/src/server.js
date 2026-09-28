@@ -10,6 +10,12 @@ const Anthropic = require('@anthropic-ai/sdk');
 const { connectDb } = require('./db');
 const { initEmbeddings } = require('./embeddings');
 const { lookupAnswer, lookupExactAnswer, saveAnswer, backfillEmbeddings } = require('./knowledgeBase');
+const {
+  getSessionProfile,
+  clearSession,
+  startSession,
+  formatSessionForPrompt,
+} = require('./session');
 
 const PORT = process.env.PORT || 8787;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
@@ -29,14 +35,10 @@ const deepgram = createClient(DEEPGRAM_API_KEY);
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 // Balanced: detailed enough for interviews, short enough for Haiku to stay fast.
-const SYSTEM_PROMPT = `You are a sharp interview co-pilot. Give a clear spoken answer the candidate can use.
+const SYSTEM_PROMPT_BASE = `You are a sharp interview co-pilot. Give a clear spoken answer the candidate can use.
 No preamble ("Sure", "Here's an answer") — answer content only.
 
 Target ~200–350 words. Be useful, not an essay.
-
-IMPORTANT: For every coding / technical question, write all code examples in JavaScript only
-(Node.js-style when backend context fits). Do not use Python, Java, C++, TypeScript-only syntax,
-or other languages unless the question explicitly asks for that language.
 
 If earlier turns are in the conversation, treat short or referential questions
 ("give an example", "why?", "what about that", "can you elaborate") as follow-ups
@@ -46,10 +48,22 @@ Structure:
 1. Direct answer (1–2 sentences)
 2. Key points as bullets (4–6 bullets)
 3. One short real-world / spoken example
-4. If technical: a small JavaScript code snippet (≤15 lines) + 1–2 trade-offs
+4. If technical: a small code snippet (≤15 lines) + 1–2 trade-offs
 5. 2 likely follow-up questions with one-line replies
 
 Prefer bullets. Skip fluff.`;
+
+const DEFAULT_LANGUAGE_RULE = `IMPORTANT: For every coding / technical question, write all code examples in JavaScript only
+(Node.js-style when backend context fits). Do not use Python, Java, C++, TypeScript-only syntax,
+or other languages unless the question explicitly asks for that language.`;
+
+function buildSystemPrompt() {
+  const profile = getSessionProfile();
+  if (!profile) {
+    return `${SYSTEM_PROMPT_BASE}\n\n${DEFAULT_LANGUAGE_RULE}`;
+  }
+  return `${SYSTEM_PROMPT_BASE}\n\n${formatSessionForPrompt(profile)}`;
+}
 
 const ANSWER_MODEL = process.env.ANSWER_MODEL || 'claude-haiku-4-5-20251001';
 const EXTRACT_MODEL = process.env.EXTRACT_MODEL || 'claude-haiku-4-5-20251001';
@@ -119,7 +133,7 @@ async function generateAnswer(transcriptText, onDelta, history = conversationHis
   const stream = anthropic.messages.stream({
     model: ANSWER_MODEL,
     max_tokens: ANSWER_MAX_TOKENS,
-    system: SYSTEM_PROMPT,
+    system: buildSystemPrompt(),
     messages,
   });
 
@@ -144,9 +158,11 @@ async function generateAnswer(transcriptText, onDelta, history = conversationHis
 async function resolveAnswer(question, onDelta) {
   const t0 = Date.now();
   const followUp = looksLikeFollowUp(question);
+  // Session-specific answers must not reuse the generic KB cache.
+  const useCache = !followUp && !getSessionProfile();
 
   // Follow-ups must not hit the standalone KB cache ("give an example" ≠ closures).
-  if (!followUp) {
+  if (useCache) {
     const cached = await lookupExactAnswer(question);
     if (cached) {
       console.log(`[kb] cache hit (${cached.matchType}) in ${Date.now() - t0}ms: "${question}"`);
@@ -159,7 +175,7 @@ async function resolveAnswer(question, onDelta) {
         followUp: false,
       };
     }
-  } else {
+  } else if (followUp) {
     console.log(`[history] follow-up with ${conversationHistory.length} prior turn(s): "${question}"`);
   }
 
@@ -168,7 +184,7 @@ async function resolveAnswer(question, onDelta) {
   const priorHistory = conversationHistory.slice();
   const answer = await generateAnswer(question, onDelta, priorHistory);
   rememberTurn(question, answer);
-  if (!followUp) {
+  if (useCache) {
     saveAnswer(question, answer).catch((err) =>
       console.warn('[kb] background save failed:', err.message),
     );
@@ -180,8 +196,9 @@ async function resolveAnswer(question, onDelta) {
 // Shared WS answer path for spoken + typed questions (keeps history in sync).
 async function streamAnswerToClient(send, question) {
   const followUp = looksLikeFollowUp(question);
+  const useCache = !followUp && !getSessionProfile();
 
-  if (!followUp) {
+  if (useCache) {
     const cached = await lookupExactAnswer(question);
     if (cached) {
       rememberTurn(question, cached.answer);
@@ -196,7 +213,7 @@ async function streamAnswerToClient(send, question) {
       });
       return;
     }
-  } else {
+  } else if (followUp) {
     console.log(`[history] follow-up with ${conversationHistory.length} prior turn(s): "${question}"`);
   }
 
@@ -206,7 +223,7 @@ async function streamAnswerToClient(send, question) {
     send({ type: 'answer-delta', question, delta });
   }, priorHistory);
   rememberTurn(question, answer);
-  if (!followUp) {
+  if (useCache) {
     saveAnswer(question, answer).catch((err) =>
       console.warn('[kb] background save failed:', err.message),
     );
@@ -312,6 +329,34 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 app.post('/clear-history', (_req, res) => {
   clearConversationHistory();
   res.json({ ok: true, turns: 0 });
+});
+
+app.get('/session', (_req, res) => {
+  res.json({ profile: getSessionProfile() });
+});
+
+app.post('/session', async (req, res) => {
+  const { jobDescription, resumeText, resumeFile } = req.body || {};
+  try {
+    const profile = await startSession({
+      jobDescription,
+      resumeText,
+      resumeFile,
+      anthropic,
+      model: EXTRACT_MODEL,
+    });
+    clearConversationHistory();
+    res.json({ profile });
+  } catch (err) {
+    console.error('[session] start failed:', err.message);
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/session/clear', (_req, res) => {
+  clearSession();
+  clearConversationHistory();
+  res.json({ ok: true, profile: null });
 });
 
 app.post('/analyze-screenshot', async (req, res) => {
