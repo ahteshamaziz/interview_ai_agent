@@ -3,6 +3,13 @@ import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
 import SessionSetup from './SessionSetup.jsx';
+import {
+  PCM_SAMPLE_RATE,
+  MAX_VOICE_CLIPS,
+  encodeWavBytes,
+  createSpeechSegmenter,
+  pushVoiceClip,
+} from './audioClips.js';
 
 const WS_URL = window.appConfig?.backendWsUrl ?? 'ws://localhost:8787/ws';
 const BACKEND_HTTP_URL = WS_URL.replace(/^ws/, 'http').replace(/\/ws$/, '');
@@ -16,6 +23,7 @@ const SHORTCUTS = {
   focus: `${MOD}K`,
   capture: `${MOD}P`,
   autoDetect: `${MOD}${SHIFT}A`,
+  buddy: `${MOD}${SHIFT}B`,
   clear: `${MOD}${SHIFT}X`,
   send: '↵',
 };
@@ -87,15 +95,33 @@ export default function App() {
   const [autoDetectStatus, setAutoDetectStatus] = useState('off');
   const [session, setSession] = useState(null);
   const [sessionReady, setSessionReady] = useState(false);
+  const [buddyEnabled, setBuddyEnabled] = useState(false);
+  const [keysOpen, setKeysOpen] = useState(false);
+  const [isFullScreen, setIsFullScreen] = useState(false);
+  const [voiceClips, setVoiceClips] = useState([]);
+  const [playingClipId, setPlayingClipId] = useState(null);
 
   const wsRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
+  const processorRef = useRef(null);
   const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
-  const levelLoopRef = useRef(null);
   const textareaRef = useRef(null);
   const autoDetectBusyRef = useRef(false);
+  const buddyEnabledRef = useRef(false);
+  const buddyCaptureRef = useRef(null);
+  const buddyBusyRef = useRef(false);
+  const buddyQueuedRef = useRef(null);
+  const onWsMessageRef = useRef(() => {});
+  const isListeningRef = useRef(false);
+  const listeningLockRef = useRef(false);
+  const listenCancelRef = useRef(false);
+  const startListeningRef = useRef(() => {});
+  const stopListeningRef = useRef(() => {});
+  const voiceClipsRef = useRef([]);
+  const playbackRef = useRef(null);
+  const flushSpeechRef = useRef(() => {});
+
+  buddyEnabledRef.current = buddyEnabled;
 
   useEffect(() => {
     let cancelled = false;
@@ -118,8 +144,18 @@ export default function App() {
   async function endSession() {
     if (isListening) stopListening();
     setAutoDetectEnabled(false);
+    if (buddyEnabledRef.current) {
+      buddyEnabledRef.current = false;
+      setBuddyEnabled(false);
+      try {
+        await window.appConfig?.setBuddyEnabled?.(false);
+      } catch {
+        // Overlay hides on the next successful toggle.
+      }
+    }
     setQaLog([]);
     setTranscript('');
+    clearVoiceClips();
     try {
       await fetch(`${BACKEND_HTTP_URL}/session/clear`, { method: 'POST' });
     } catch {
@@ -158,6 +194,134 @@ export default function App() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!window.appConfig?.onBuddyEnabled) return undefined;
+    return window.appConfig.onBuddyEnabled((payload) => {
+      const enabled = Boolean(payload?.enabled);
+      buddyEnabledRef.current = enabled;
+      setBuddyEnabled(enabled);
+      if (payload && payload.displayId != null) {
+        buddyCaptureRef.current = {
+          displayId: payload.displayId,
+          width: payload.captureSize?.width,
+          height: payload.captureSize?.height,
+        };
+      }
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'buddy-mode', enabled }));
+      }
+      if (enabled) {
+        if (!isListeningRef.current) startListeningRef.current();
+      } else if (isListeningRef.current || listeningLockRef.current) {
+        stopListeningRef.current();
+      }
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!buddyEnabled) return undefined;
+    window.appConfig?.pushBuddyEvent?.({ type: 'listening', listening: isListening });
+  }, [buddyEnabled, isListening]);
+
+  useEffect(() => {
+    if (!buddyEnabled) return undefined;
+    window.appConfig?.pushBuddyEvent?.({ type: 'transcript', text: transcript });
+  }, [buddyEnabled, transcript]);
+
+  useEffect(() => {
+    const sendHits = () => {
+      const rects = [...document.querySelectorAll('[data-hit]')].map((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          id: node.getAttribute('data-hit'),
+          x: rect.x,
+          y: rect.y,
+          width: rect.width,
+          height: rect.height,
+        };
+      });
+      window.appConfig?.setMainHitRects?.(rects);
+    };
+    const frame = requestAnimationFrame(sendHits);
+    window.addEventListener('resize', sendHits);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', sendHits);
+    };
+  }, [keysOpen, session, sessionReady, buddyEnabled]);
+
+  useEffect(() => {
+    if (!window.appConfig?.onKeysHot) return undefined;
+    return window.appConfig.onKeysHot((hot) => {
+      if (buddyEnabledRef.current) setKeysOpen(Boolean(hot));
+    });
+  }, []);
+
+  async function toggleBuddy() {
+    if (!window.appConfig?.setBuddyEnabled) {
+      setStatusMessage('buddy needs the desktop app');
+      return;
+    }
+    const next = !buddyEnabledRef.current;
+    try {
+      await window.appConfig.setBuddyEnabled(next);
+    } catch (err) {
+      setStatusMessage(err.message || 'buddy unavailable');
+    }
+  }
+
+  async function runBuddyQuestion(question) {
+    const asked = String(question || '').trim();
+    if (!asked || !buddyEnabledRef.current) return;
+    if (buddyBusyRef.current) {
+      buddyQueuedRef.current = asked;
+      return;
+    }
+    buddyBusyRef.current = true;
+    setStatusMessage('capturing…');
+    window.appConfig?.pushBuddyEvent?.({ type: 'thinking', question: asked });
+    try {
+      if (!window.appConfig?.captureScreen) throw new Error('screenshot unavailable');
+      const imageBase64 = await window.appConfig.captureScreen(buddyCaptureRef.current || undefined);
+      setStatusMessage('pointing…');
+      const res = await fetch(`${BACKEND_HTTP_URL}/buddy-point`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: asked, imageBase64 }),
+      });
+      const payload = await res.json();
+      if (!res.ok) throw new Error(payload?.error || 'guide failed');
+      window.appConfig?.pushBuddyEvent?.({
+        type: 'result',
+        question: asked,
+        answer: payload.answer,
+        highlight: payload.highlight,
+        label: payload.label,
+      });
+      setQaLog((prev) => [
+        ...prev,
+        {
+          question: asked,
+          answer: payload.answer,
+          source: 'guide',
+          label: payload.label,
+        },
+      ]);
+      setTranscript('');
+      setStatusMessage(payload.highlight ? 'highlighted' : 'answered');
+    } catch (err) {
+      const message = err.message || 'guide error';
+      setStatusMessage(message);
+      window.appConfig?.pushBuddyEvent?.({ type: 'error', question: asked, message });
+    } finally {
+      buddyBusyRef.current = false;
+      const next = buddyQueuedRef.current;
+      buddyQueuedRef.current = null;
+      if (next && buddyEnabledRef.current) runBuddyQuestion(next);
+    }
+  }
 
   async function toggleStealth() {
     if (!stealthAvailable) return;
@@ -349,6 +513,13 @@ export default function App() {
         return;
       }
 
+      // Ctrl/Cmd + Shift + B: toggle the screen guide
+      if (e.shiftKey && key.toLowerCase() === 'b') {
+        e.preventDefault();
+        toggleBuddy();
+        return;
+      }
+
       // Ctrl/Cmd + Shift + X: clear Q/A history
       if (e.shiftKey && key.toLowerCase() === 'x') {
         e.preventDefault();
@@ -455,64 +626,282 @@ export default function App() {
     }
   }
 
+  function updateVoiceClip(id, patch) {
+    const next = voiceClipsRef.current.map((clip) => (clip.id === id ? { ...clip, ...patch } : clip));
+    voiceClipsRef.current = next;
+    setVoiceClips(next);
+  }
+
+  function rememberVoiceClip(clip) {
+    const prev = voiceClipsRef.current;
+    const { next, dropped } = pushVoiceClip(prev, clip);
+    for (const droppedClip of dropped) {
+      if (playbackRef.current?.id === droppedClip.id) {
+        playbackRef.current.audio.pause();
+        playbackRef.current = null;
+        setPlayingClipId(null);
+      }
+      URL.revokeObjectURL(droppedClip.url);
+    }
+    voiceClipsRef.current = next;
+    setVoiceClips(next);
+  }
+
+  function clearVoiceClips() {
+    if (playbackRef.current) {
+      playbackRef.current.audio.pause();
+      playbackRef.current = null;
+    }
+    for (const clip of voiceClipsRef.current) URL.revokeObjectURL(clip.url);
+    voiceClipsRef.current = [];
+    setVoiceClips([]);
+    setPlayingClipId(null);
+  }
+
+  function toggleClipPlayback(clip) {
+    if (playbackRef.current?.id === clip.id) {
+      playbackRef.current.audio.pause();
+      playbackRef.current = null;
+      setPlayingClipId(null);
+      return;
+    }
+    playbackRef.current?.audio.pause();
+    const audio = new Audio(clip.url);
+    audio.onended = () => {
+      if (playbackRef.current?.id === clip.id) {
+        playbackRef.current = null;
+        setPlayingClipId(null);
+      }
+    };
+    playbackRef.current = { id: clip.id, audio };
+    setPlayingClipId(clip.id);
+    audio.play().catch(() => {
+      playbackRef.current = null;
+      setPlayingClipId(null);
+    });
+  }
+
+  async function retryClipTranscription(clip) {
+    updateVoiceClip(clip.id, { status: 'retrying', error: '' });
+    try {
+      const res = await fetch(`${BACKEND_HTTP_URL}/transcribe`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'audio/wav' },
+        body: clip.blob,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'transcription failed');
+      const text = String(data.text || '').trim();
+      updateVoiceClip(clip.id, {
+        status: text ? 'ready' : 'empty',
+        transcript: text,
+        error: text ? '' : 'No speech detected in this clip',
+      });
+      if (text) {
+        setTextInput(text);
+        setKeysOpen(true);
+        setTimeout(() => textareaRef.current?.focus(), 0);
+      }
+    } catch (err) {
+      updateVoiceClip(clip.id, { status: 'error', error: err.message || 'transcription failed' });
+    }
+  }
+
   async function startListening() {
+    if (listeningLockRef.current || isListeningRef.current) return;
+    listeningLockRef.current = true;
+    listenCancelRef.current = false;
     const ws = new WebSocket(WS_URL);
     wsRef.current = ws;
+    const outbound = [];
 
-    ws.onopen = () => setStatusMessage('connected');
+    const flushOutbound = () => {
+      while (outbound.length && ws.readyState === WebSocket.OPEN) {
+        ws.send(outbound.shift());
+      }
+    };
+
+    ws.onopen = () => {
+      setStatusMessage('connected');
+      ws.send(JSON.stringify({ type: 'buddy-mode', enabled: buddyEnabledRef.current }));
+      flushOutbound();
+    };
     ws.onclose = () => setStatusMessage('disconnected');
     ws.onerror = () => setStatusMessage('error');
 
     ws.onmessage = (event) => {
-      handleWsPayload(JSON.parse(event.data));
+      onWsMessageRef.current(JSON.parse(event.data));
     };
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined },
-    });
+    const sendPcm = (pcm) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        flushOutbound();
+        ws.send(pcm);
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        outbound.push(pcm);
+        if (outbound.length > 100) outbound.shift();
+      }
+    };
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: selectedDeviceId ? { exact: selectedDeviceId } : undefined,
+          channelCount: { ideal: 1 },
+          echoCancellation: { ideal: false },
+          noiseSuppression: { ideal: false },
+          autoGainControl: { ideal: true },
+        },
+      });
+    } catch (err) {
+      listeningLockRef.current = false;
+      ws.close();
+      setStatusMessage(err.message || 'microphone unavailable');
+      return;
+    }
+    if (listenCancelRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+      ws.close();
+      listeningLockRef.current = false;
+      return;
+    }
     streamRef.current = stream;
-
-    const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
-    mediaRecorderRef.current = mediaRecorder;
-
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
-        ws.send(event.data);
+    const micTrack = stream.getAudioTracks()[0];
+    if (micTrack) {
+      try {
+        await micTrack.applyConstraints({
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: true,
+        });
+      } catch {
+        // Some virtual devices ignore these. Capture still continues.
       }
-    };
+    }
 
-    mediaRecorder.start(250);
-    setIsListening(true);
+    const segmenter = createSpeechSegmenter({
+      onClip: ({ chunks, durationMs }) => {
+        const bytes = encodeWavBytes(chunks, PCM_SAMPLE_RATE);
+        const blob = new Blob([bytes], { type: 'audio/wav' });
+        rememberVoiceClip({
+          id: `clip-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          url: URL.createObjectURL(blob),
+          blob,
+          durationMs,
+          label: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          transcript: '',
+          status: 'saved',
+          error: '',
+        });
+      },
+    });
+    flushSpeechRef.current = () => segmenter.flush();
 
-    const audioContext = new AudioContext();
+    let audioContext;
+    try {
+      audioContext = new AudioContext({ sampleRate: PCM_SAMPLE_RATE });
+    } catch {
+      audioContext = new AudioContext();
+    }
     audioContextRef.current = audioContext;
-    const source = audioContext.createMediaStreamSource(stream);
-    const analyser = audioContext.createAnalyser();
-    analyser.fftSize = 512;
-    source.connect(analyser);
-    analyserRef.current = analyser;
+    await audioContext.resume();
+    if (listenCancelRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+      ws.close();
+      audioContext.close();
+      listeningLockRef.current = false;
+      return;
+    }
 
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    const tick = () => {
-      analyser.getByteTimeDomainData(data);
-      let sumSquares = 0;
-      for (let i = 0; i < data.length; i++) {
-        const normalized = (data[i] - 128) / 128;
-        sumSquares += normalized * normalized;
+    let lastMeterAt = 0;
+    const handleFrame = (input) => {
+      if (!isListeningRef.current || !input?.length) return;
+      const framed = segmenter.push(input, audioContext.sampleRate);
+      if (!framed) return;
+      const now = performance.now();
+      if (now - lastMeterAt > 80) {
+        lastMeterAt = now;
+        setMicLevel(Math.min(1, framed.rms * 4));
       }
-      const rms = Math.sqrt(sumSquares / data.length);
-      setMicLevel(Math.min(1, rms * 4));
-      levelLoopRef.current = requestAnimationFrame(tick);
+      sendPcm(framed.pcm);
     };
-    tick();
+
+    const source = audioContext.createMediaStreamSource(stream);
+    const mute = audioContext.createGain();
+    mute.gain.value = 0;
+    mute.connect(audioContext.destination);
+
+    let processor;
+    try {
+      const workletUrl = URL.createObjectURL(
+        new Blob(
+          [
+            `class PcmCaptureProcessor extends AudioWorkletProcessor {
+              process(inputs) {
+                const channel = inputs[0] && inputs[0][0];
+                if (channel && channel.length) this.port.postMessage(channel);
+                return true;
+              }
+            }
+            registerProcessor('pcm-capture', PcmCaptureProcessor);`,
+          ],
+          { type: 'application/javascript' },
+        ),
+      );
+      await audioContext.audioWorklet.addModule(workletUrl);
+      URL.revokeObjectURL(workletUrl);
+      processor = new AudioWorkletNode(audioContext, 'pcm-capture');
+      processor.port.onmessage = (event) => handleFrame(event.data);
+    } catch {
+      if (typeof audioContext.createScriptProcessor !== 'function') {
+        stream.getTracks().forEach((track) => track.stop());
+        ws.close();
+        audioContext.close();
+        listeningLockRef.current = false;
+        setStatusMessage('audio capture unavailable');
+        return;
+      }
+      processor = audioContext.createScriptProcessor(2048, 1, 1);
+      processor.onaudioprocess = (event) => handleFrame(event.inputBuffer.getChannelData(0));
+    }
+
+    if (listenCancelRef.current) {
+      stream.getTracks().forEach((track) => track.stop());
+      ws.close();
+      audioContext.close();
+      listeningLockRef.current = false;
+      return;
+    }
+
+    isListeningRef.current = true;
+    processorRef.current = processor;
+    source.connect(processor);
+    processor.connect(mute);
+    listeningLockRef.current = false;
+    setIsListening(true);
   }
 
   function stopListening() {
-    mediaRecorderRef.current?.stop();
+    listenCancelRef.current = true;
+    isListeningRef.current = false;
+    listeningLockRef.current = false;
+    try {
+      flushSpeechRef.current();
+    } catch {
+      // Segmenter may not have started yet.
+    }
+    flushSpeechRef.current = () => {};
+    try {
+      processorRef.current?.disconnect();
+    } catch {
+      // Processor may not have started yet.
+    }
+    processorRef.current = null;
     streamRef.current?.getTracks().forEach((track) => track.stop());
     wsRef.current?.close();
-    if (levelLoopRef.current) cancelAnimationFrame(levelLoopRef.current);
     audioContextRef.current?.close();
+    audioContextRef.current = null;
     setMicLevel(0);
     setIsListening(false);
     setStatusMessage('idle');
@@ -564,38 +953,40 @@ export default function App() {
     }
   }
 
+  onWsMessageRef.current = (payload) => {
+    if (payload.type === 'buddy-question') {
+      runBuddyQuestion(payload.question);
+      return;
+    }
+    handleWsPayload(payload);
+  };
+  startListeningRef.current = startListening;
+  stopListeningRef.current = stopListening;
+
   return (
     <div className="app" style={{ backgroundColor: `rgba(17, 20, 24, ${opacity})` }}>
-      <header className="drag-region">
-        <h1>Interview Copilot</h1>
-        <div className="header-right">
-          {stealthAvailable && (
-            <button
-              type="button"
-              tabIndex={-1}
-              className={`stealth-toggle ${stealthEnabled ? 'stealth-on' : 'stealth-off'}`}
-              onClick={toggleStealth}
-              title={
-                stealthEnabled
-                  ? 'Stealth ON: window is excluded from screen capture'
-                  : 'Stealth OFF: window may appear in screen capture'
-              }
-            >
-              {stealthEnabled ? 'Hide: ON' : 'Hide: OFF'}
-            </button>
-          )}
-          <input
-            type="range"
-            className="opacity-slider"
-            min="0.2"
-            max="1"
-            step="0.05"
-            value={opacity}
-            onChange={(e) => setOpacity(parseFloat(e.target.value))}
-            title={`Opacity: ${Math.round(opacity * 100)}%`}
-          />
-          <span className={`status status-${statusMessage}`}>{statusMessage}</span>
+      <header className="drag-region titlebar" data-hit="title">
+        <div className="window-controls">
+          <button type="button" className="win-btn win-close" onClick={() => window.appConfig?.windowClose?.()} title="Close">
+            ×
+          </button>
+          <button type="button" className="win-btn win-min" onClick={() => window.appConfig?.windowMinimize?.()} title="Minimize">
+            –
+          </button>
+          <button
+            type="button"
+            className="win-btn win-full"
+            onClick={async () => {
+              const next = await window.appConfig?.windowToggleFullscreen?.();
+              if (typeof next === 'boolean') setIsFullScreen(next);
+            }}
+            title={isFullScreen ? 'Exit full screen' : 'Full screen'}
+          >
+            {isFullScreen ? '↘' : '↗'}
+          </button>
         </div>
+        <h1>Interview Copilot</h1>
+        <span className={`status status-${statusMessage}`}>{statusMessage}</span>
       </header>
 
       {!sessionReady ? (
@@ -621,27 +1012,130 @@ export default function App() {
         </button>
       </div>
 
-      <div className="controls">
-        <select
-          value={selectedDeviceId}
-          onChange={(e) => setSelectedDeviceId(e.target.value)}
-          disabled={isListening}
-        >
-          {devices.map((d) => (
-            <option key={d.deviceId} value={d.deviceId}>
-              {d.label || `Microphone ${d.deviceId.slice(0, 6)}`}
-            </option>
-          ))}
-        </select>
+      <div
+        className={`keys-dock ${keysOpen ? 'is-open' : ''}`}
+        data-hit="keys"
+        onMouseEnter={() => {
+          if (!buddyEnabledRef.current) setKeysOpen(true);
+        }}
+        onMouseLeave={() => {
+          if (!buddyEnabledRef.current) setKeysOpen(false);
+        }}
+      >
+        <div className="keys-tab">Controls</div>
+        {keysOpen && (
+          <div className="keys-panel">
+            <div className="header-right">
+              {stealthAvailable && (
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  className={`stealth-toggle ${stealthEnabled ? 'stealth-on' : 'stealth-off'}`}
+                  onClick={toggleStealth}
+                  title={
+                    stealthEnabled
+                      ? 'Stealth ON: window is excluded from screen capture'
+                      : 'Stealth OFF: window may appear in screen capture'
+                  }
+                >
+                  {stealthEnabled ? 'Hide: ON' : 'Hide: OFF'}
+                </button>
+              )}
+              <input
+                type="range"
+                className="opacity-slider"
+                min="0.2"
+                max="1"
+                step="0.05"
+                value={opacity}
+                onChange={(e) => setOpacity(parseFloat(e.target.value))}
+                title={`Opacity: ${Math.round(opacity * 100)}%`}
+              />
+            </div>
+            <div className="controls">
+              <select
+                value={selectedDeviceId}
+                onChange={(e) => setSelectedDeviceId(e.target.value)}
+                disabled={isListening}
+              >
+                {devices.map((d) => (
+                  <option key={d.deviceId} value={d.deviceId}>
+                    {d.label || `Microphone ${d.deviceId.slice(0, 6)}`}
+                  </option>
+                ))}
+              </select>
 
-        {!isListening ? (
-          <button onClick={startListening} title={`Start listening (${SHORTCUTS.listen})`}>
-            Start Listening <Kbd>{SHORTCUTS.listen}</Kbd>
-          </button>
-        ) : (
-          <button onClick={stopListening} title={`Stop listening (${SHORTCUTS.listen})`}>
-            Stop <Kbd>{SHORTCUTS.listen}</Kbd>
-          </button>
+              {!isListening ? (
+                <button onClick={startListening} title={`Start listening (${SHORTCUTS.listen})`}>
+                  Start Listening <Kbd>{SHORTCUTS.listen}</Kbd>
+                </button>
+              ) : (
+                <button onClick={stopListening} title={`Stop listening (${SHORTCUTS.listen})`}>
+                  Stop <Kbd>{SHORTCUTS.listen}</Kbd>
+                </button>
+              )}
+            </div>
+            <div className="screenshot-section">
+              <button
+                className="screenshot-btn"
+                onClick={captureAndAnalyzeScreen}
+                disabled={isCapturing}
+                title={`Capture screen (${SHORTCUTS.capture})`}
+              >
+                {isCapturing ? 'Capturing…' : 'Capture Screen'} <Kbd>{SHORTCUTS.capture}</Kbd>
+              </button>
+              <button
+                className={`auto-detect-btn ${autoDetectEnabled ? 'auto-detect-on' : ''}`}
+                onClick={toggleAutoDetect}
+                title={`Auto-detect questions on screen (${SHORTCUTS.autoDetect})`}
+              >
+                {autoDetectEnabled ? `Auto-Detect: ${autoDetectStatus}` : 'Auto-Detect: OFF'}{' '}
+                <Kbd>{SHORTCUTS.autoDetect}</Kbd>
+              </button>
+              <button
+                type="button"
+                className={`buddy-toggle ${buddyEnabled ? 'buddy-on' : ''}`}
+                onClick={toggleBuddy}
+                title="When on, clicks pass through this window, listening starts, and the buddy asks what to do where you rest the cursor."
+              >
+                {buddyEnabled ? 'Buddy: ON' : 'Buddy: OFF'} <Kbd>{SHORTCUTS.buddy}</Kbd>
+              </button>
+            </div>
+            {buddyEnabled && (
+              <p className="buddy-hint">
+                Listening is on. Rest the cursor and the buddy asks what to do. Clicks pass through this window.
+              </p>
+            )}
+            <div className="text-input-section">
+              <div className="text-input-label">
+                Type question if audio is unclear <Kbd>{SHORTCUTS.focus}</Kbd>
+              </div>
+              <div className="text-input-row">
+                <textarea
+                  className="text-input"
+                  placeholder="Type the interview question here..."
+                  value={textInput}
+                  onChange={(e) => setTextInput(e.target.value)}
+                  onKeyDown={handleTextKeyDown}
+                  disabled={isSendingText}
+                  rows={2}
+                  ref={textareaRef}
+                />
+                <button
+                  className="send-btn"
+                  onClick={sendTextQuestion}
+                  disabled={!textInput.trim() || isSendingText}
+                  title={`Send question (${SHORTCUTS.send})`}
+                >
+                  {isSendingText ? '...' : (
+                    <>
+                      Send <Kbd>{SHORTCUTS.send}</Kbd>
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
         )}
       </div>
 
@@ -661,54 +1155,43 @@ export default function App() {
         </div>
       )}
 
-      <div className="screenshot-section">
-        <button
-          className="screenshot-btn"
-          onClick={captureAndAnalyzeScreen}
-          disabled={isCapturing}
-          title={`Capture screen (${SHORTCUTS.capture})`}
-        >
-          {isCapturing ? 'Capturing…' : 'Capture Screen'} <Kbd>{SHORTCUTS.capture}</Kbd>
-        </button>
-        <button
-          className={`auto-detect-btn ${autoDetectEnabled ? 'auto-detect-on' : ''}`}
-          onClick={toggleAutoDetect}
-          title={`Auto-detect questions on screen (${SHORTCUTS.autoDetect})`}
-        >
-          {autoDetectEnabled ? `Auto-Detect: ${autoDetectStatus}` : 'Auto-Detect: OFF'}{' '}
-          <Kbd>{SHORTCUTS.autoDetect}</Kbd>
-        </button>
-      </div>
-
-      <div className="text-input-section">
-        <div className="text-input-label">
-          Type question if audio is unclear <Kbd>{SHORTCUTS.focus}</Kbd>
+      {(isListening || voiceClips.length > 0) && (
+        <div className="voice-clips">
+          <div className="voice-clips-head">
+            <strong>Recent audio</strong>
+            <span>Latest {MAX_VOICE_CLIPS} turns are kept. Older ones are deleted.</span>
+          </div>
+          {voiceClips.length === 0 ? (
+            <div className="voice-clips-empty">Speak, and the turn is saved here if the live text is wrong.</div>
+          ) : (
+            voiceClips.map((clip) => (
+              <div key={clip.id} className="voice-clip-row">
+                <div className="voice-clip-meta">
+                  <div className="voice-clip-title">
+                    {clip.label} · {(clip.durationMs / 1000).toFixed(1)}s
+                  </div>
+                  <div className="voice-clip-text">
+                    {clip.status === 'retrying'
+                      ? 'Converting to text…'
+                      : clip.transcript || clip.error || 'Saved — retry if the live transcript missed it'}
+                  </div>
+                </div>
+                <button type="button" className="clip-btn" onClick={() => toggleClipPlayback(clip)}>
+                  {playingClipId === clip.id ? 'Stop' : 'Play'}
+                </button>
+                <button
+                  type="button"
+                  className="clip-btn"
+                  onClick={() => retryClipTranscription(clip)}
+                  disabled={clip.status === 'retrying'}
+                >
+                  {clip.status === 'retrying' ? 'Working…' : 'Retry text'}
+                </button>
+              </div>
+            ))
+          )}
         </div>
-        <div className="text-input-row">
-          <textarea
-            className="text-input"
-            placeholder="Type the interview question here..."
-            value={textInput}
-            onChange={(e) => setTextInput(e.target.value)}
-            onKeyDown={handleTextKeyDown}
-            disabled={isSendingText}
-            rows={2}
-            ref={textareaRef}
-          />
-          <button
-            className="send-btn"
-            onClick={sendTextQuestion}
-            disabled={!textInput.trim() || isSendingText}
-            title={`Send question (${SHORTCUTS.send})`}
-          >
-            {isSendingText ? '...' : (
-              <>
-                Send <Kbd>{SHORTCUTS.send}</Kbd>
-              </>
-            )}
-          </button>
-        </div>
-      </div>
+      )}
 
       <div className="qa-log">
         {qaLog
@@ -721,8 +1204,8 @@ export default function App() {
                 {qa.streaming ? (
                   <span className="source-badge source-streaming">streaming</span>
                 ) : qa.source ? (
-                  <span className={`source-badge ${qa.source === 'cache' ? 'source-cache' : 'source-model'}`}>
-                    {qa.source === 'cache' ? 'memory' : 'model'}
+                  <span className={`source-badge ${qa.source === 'cache' ? 'source-cache' : qa.source === 'guide' ? 'source-guide' : 'source-model'}`}>
+                    {qa.source === 'cache' ? 'memory' : qa.source === 'guide' ? 'guide' : 'model'}
                   </span>
                 ) : null}
               </div>

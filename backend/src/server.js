@@ -326,6 +326,38 @@ app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// Full-clip transcription for a saved take. More reliable than the live stream
+// when a spoken turn was missed or only partly recognized.
+app.post(
+  '/transcribe',
+  express.raw({ type: ['audio/wav', 'audio/webm', 'application/octet-stream'], limit: '12mb' }),
+  async (req, res) => {
+    const audio = req.body;
+    if (!Buffer.isBuffer(audio) || audio.length < 44) {
+      res.status(400).json({ error: 'Send a WAV audio body' });
+      return;
+    }
+    try {
+      const response = await deepgram.listen.prerecorded.transcribeFile(audio, {
+        model: 'nova-2',
+        smart_format: true,
+        punctuate: true,
+      });
+      const dgError = response?.error;
+      if (dgError) {
+        throw new Error(dgError.message || String(dgError));
+      }
+      const result = response?.result || response;
+      const text = result?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim() || '';
+      console.log(`[transcribe] retry ${audio.length} bytes -> "${text.slice(0, 120)}"`);
+      res.json({ text });
+    } catch (err) {
+      console.error('[transcribe] error:', err.message);
+      res.status(500).json({ error: err.message || 'transcription failed' });
+    }
+  },
+);
+
 app.post('/clear-history', (_req, res) => {
   clearConversationHistory();
   res.json({ ok: true, turns: 0 });
@@ -420,6 +452,156 @@ app.post('/analyze-screenshot', async (req, res) => {
   }
 });
 
+function clamp01(n) {
+  return Math.min(1, Math.max(0, n));
+}
+
+function pngSize(base64) {
+  const buf = Buffer.from(String(base64 || '').slice(0, 80), 'base64');
+  if (buf.length < 24 || buf.toString('ascii', 1, 4) !== 'PNG') return null;
+  return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+}
+
+function normalizeHighlight(input, imageSize) {
+  if (!input) return null;
+  let x;
+  let y;
+  let w;
+  let h;
+  if (Array.isArray(input) && input.length >= 4) {
+    [x, y, w, h] = input;
+  } else if (typeof input === 'object') {
+    x = input.x;
+    y = input.y;
+    w = input.w ?? input.width;
+    h = input.h ?? input.height;
+  } else {
+    return null;
+  }
+  x = Number(x);
+  y = Number(y);
+  w = Number(w);
+  h = Number(h);
+  if (![x, y, w, h].every((n) => Number.isFinite(n))) return null;
+  // Fractions stay as-is. Anything larger is the 0–1000 grid (or pixels, scaled below).
+  const max = Math.max(Math.abs(x), Math.abs(y), Math.abs(w), Math.abs(h));
+  if (max > 1000 && imageSize?.width && imageSize?.height) {
+    x /= imageSize.width;
+    w /= imageSize.width;
+    y /= imageSize.height;
+    h /= imageSize.height;
+  } else if (max > 1) {
+    x /= 1000;
+    y /= 1000;
+    w /= 1000;
+    h /= 1000;
+  }
+  x = clamp01(x);
+  y = clamp01(y);
+  w = clamp01(w);
+  h = clamp01(h);
+  if (x + w > 1) w = 1 - x;
+  if (y + h > 1) h = 1 - y;
+  if (w < 0.015 || h < 0.015) return null;
+  if (w > 0.95 && h > 0.95) return null;
+  return {
+    x: Number(x.toFixed(4)),
+    y: Number(y.toFixed(4)),
+    w: Number(w.toFixed(4)),
+    h: Number(h.toFixed(4)),
+  };
+}
+
+function parseBuddyJson(raw) {
+  const text = String(raw || '').trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1] : text;
+  const start = candidate.indexOf('{');
+  const end = candidate.lastIndexOf('}');
+  if (start === -1 || end <= start) throw new Error('no json');
+  return JSON.parse(candidate.slice(start, end + 1));
+}
+
+app.post('/buddy-point', async (req, res) => {
+  const { question, imageBase64 } = req.body || {};
+  const asked = String(question || '').trim();
+  if (!asked) return res.status(400).json({ error: 'No question provided' });
+  if (!imageBase64) return res.status(400).json({ error: 'No image provided' });
+
+  const t0 = Date.now();
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filename = `buddy-${timestamp}.png`;
+    const filepath = path.join(SCREENSHOTS_DIR, filename);
+    fs.promises
+      .writeFile(filepath, Buffer.from(imageBase64, 'base64'))
+      .then(() => console.log(`[buddy] saved to ${filepath}`))
+      .catch((err) => console.warn('[buddy] save failed:', err.message));
+
+    const profile = getSessionProfile();
+    const historyNote = conversationHistory
+      .slice(-3)
+      .map((turn) => `User: ${turn.question}\nBuddy: ${String(turn.answer || '').slice(0, 500)}`)
+      .join('\n');
+
+    const system = [
+      'You guide someone looking at their screen. They asked a spoken question.',
+      'Reply with JSON only. No markdown fences.',
+      'highlight uses a 1000 by 1000 grid over the screenshot. x=0,y=0 is the top-left. x=1000,y=1000 is the bottom-right.',
+      'x and y are the top-left of the box. w and h are its width and height. All four are integers from 0 to 1000.',
+      'Example: the top-left quarter is {"x":0,"y":0,"w":500,"h":250}.',
+      'Box only the exact control, line, code, or error the question is about. Never box the whole screen.',
+      'Use null for highlight when nothing visible matches.',
+      'answer is one short reply for a cursor bubble: 2–4 sentences, about 40–80 words. Markdown is fine.',
+      'No preamble like "Sure".',
+      profile ? formatSessionForPrompt(profile) : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    const prompt = [
+      historyNote ? `Recent chat:\n${historyNote}` : '',
+      `Spoken question: ${asked}`,
+      'Return JSON with keys "answer" (string), "label" (3-6 words, or null), and "highlight" ({"x","y","w","h"} on a 0–1000 grid, or null).',
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+
+    const msg = await anthropic.messages.create({
+      model: ANSWER_MODEL,
+      max_tokens: 900,
+      system,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageBase64 } },
+          { type: 'text', text: prompt },
+        ],
+      }],
+    });
+    const raw = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('').trim();
+
+    let answer = raw;
+    let label = null;
+    let highlight = null;
+    try {
+      const parsed = parseBuddyJson(raw);
+      answer = String(parsed.answer || '').trim() || raw;
+      label = parsed.label ? String(parsed.label).trim().slice(0, 80) : null;
+      highlight = normalizeHighlight(parsed.highlight, pngSize(imageBase64));
+    } catch (parseErr) {
+      console.warn('[buddy] JSON parse failed, using raw text:', parseErr.message);
+    }
+
+    rememberTurn(asked, answer);
+    console.log(`[buddy] point in ${Date.now() - t0}ms highlight=${highlight ? 'yes' : 'no'}`);
+    res.json({ answer, label, highlight, question: asked, source: 'guide', savedAs: filename });
+  } catch (err) {
+    console.error('[buddy] error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
@@ -427,12 +609,27 @@ wss.on('connection', (clientSocket) => {
   console.log('[ws] client connected');
   let chunkCount = 0;
   let dgIsOpen = false;
+  let dgConnection = null;
+  let reconnectTimer = null;
+  let reconnecting = false;
+  let clientGone = false;
   const pendingChunks = [];
+  let pendingBytes = 0;
+  const MAX_PENDING_BYTES = 16000 * 2 * 8;
+
+  const bufferChunk = (chunk) => {
+    pendingChunks.push(chunk);
+    pendingBytes += chunk.length;
+    while (pendingBytes > MAX_PENDING_BYTES && pendingChunks.length > 1) {
+      pendingBytes -= pendingChunks.shift().length;
+    }
+  };
   let finalBuffer = '';
   let finalizeTimer = null;
   let answerInFlight = false;
   let lastAnsweredText = '';
   let lastAnswerAt = 0;
+  let buddyMode = false;
 
   const send = (payload) => {
     if (clientSocket.readyState === clientSocket.OPEN) {
@@ -487,7 +684,12 @@ wss.on('connection', (clientSocket) => {
       console.log(`[utterance] answering: "${question}"`);
 
       try {
-        await streamAnswerToClient(send, question);
+        if (buddyMode) {
+          console.log(`[buddy] voice question, waiting for screen point: "${question}"`);
+          send({ type: 'buddy-question', question });
+        } else {
+          await streamAnswerToClient(send, question);
+        }
       } catch (err) {
         send({ type: 'error', message: `Answer error: ${err.message}` });
       } finally {
@@ -496,70 +698,93 @@ wss.on('connection', (clientSocket) => {
     }, delay);
   };
 
-  const dgConnection = deepgram.listen.live({
-    model: 'nova-2',
-    smart_format: true,
-    interim_results: true,
-    endpointing: DG_ENDPOINTING_MS,
-    // Silence gap Deepgram needs before UtteranceEnd. Keep above endpointing
-    // so brief thinking pauses don't close the turn.
-    utterance_end_ms: Math.min(5000, Math.max(DG_ENDPOINTING_MS + 400, 1600)),
-    vad_events: true,
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Open, () => {
-    dgIsOpen = true;
-    console.log(`[ws] deepgram open, flushing ${pendingChunks.length} buffered chunks`);
-    for (const buffered of pendingChunks) {
-      dgConnection.send(buffered);
-    }
-    pendingChunks.length = 0;
-    send({ type: 'status', message: 'transcription-ready' });
-  });
-
-  dgConnection.on(LiveTranscriptionEvents.Transcript, async (data) => {
-    const alt = data.channel?.alternatives?.[0];
-    const text = alt?.transcript?.trim();
-    if (!text) return;
-
-    const isFinal = Boolean(data.is_final);
-    send({ type: 'transcript', text, isFinal });
-
-    // Interim audio means the speaker resumed — cancel any pending answer
-    // so a thinking pause doesn't split one question into multiple.
-    if (!isFinal) {
-      clearFinalizeTimer();
-      return;
-    }
-
-    // Build a single utterance across short pauses.
-    finalBuffer = `${finalBuffer} ${text}`.trim();
-
-    // Prefer Deepgram's end-of-speech signal. Still arm a long fallback on
-    // plain `is_final` so we don't hang if `speech_final` is missing — but
-    // never use the short delay for those mid-pause segment finals.
-    const speechFinal = Boolean(data.speech_final);
-    enqueueFinalize({ fromSpeechFinal: speechFinal });
-  });
-
-  // Fallback end-of-turn when Deepgram's utterance detector fires.
-  if (LiveTranscriptionEvents.UtteranceEnd) {
-    dgConnection.on(LiveTranscriptionEvents.UtteranceEnd, () => {
-      if (!finalBuffer.trim()) return;
-      console.log(`[utterance] deepgram UtteranceEnd: "${finalBuffer}"`);
-      enqueueFinalize({ fromSpeechFinal: true });
+  // Raw linear16 has no container header, so a dropped socket can reconnect
+  // and keep transcribing. Compressed webm slices could not.
+  const startDeepgram = () => {
+    if (clientGone) return;
+    const dg = deepgram.listen.live({
+      model: 'nova-2',
+      smart_format: true,
+      interim_results: true,
+      encoding: 'linear16',
+      sample_rate: 16000,
+      channels: 1,
+      endpointing: DG_ENDPOINTING_MS,
+      // Silence gap Deepgram needs before UtteranceEnd. Keep above endpointing
+      // so brief thinking pauses don't close the turn.
+      utterance_end_ms: Math.min(5000, Math.max(DG_ENDPOINTING_MS + 400, 1600)),
+      vad_events: true,
     });
-  }
+    dgConnection = dg;
 
-  dgConnection.on(LiveTranscriptionEvents.Error, (err) => {
-    console.error('[deepgram] error', err);
-    send({ type: 'error', message: `Deepgram error: ${err.message || err}` });
-  });
+    dg.on(LiveTranscriptionEvents.Open, () => {
+      if (dg !== dgConnection) return;
+      dgIsOpen = true;
+      console.log(`[ws] deepgram open, flushing ${pendingChunks.length} buffered chunks`);
+      for (const buffered of pendingChunks) dg.send(buffered);
+      pendingChunks.length = 0;
+      pendingBytes = 0;
+      send({ type: 'status', message: 'transcription-ready' });
+    });
 
-  dgConnection.on(LiveTranscriptionEvents.Close, (closeEvent) => {
-    console.log('[deepgram] closed', closeEvent?.code, closeEvent?.reason);
-    send({ type: 'status', message: 'transcription-closed' });
-  });
+    dg.on(LiveTranscriptionEvents.Transcript, async (data) => {
+      if (dg !== dgConnection) return;
+      const alt = data.channel?.alternatives?.[0];
+      const text = alt?.transcript?.trim();
+      if (!text) return;
+
+      const isFinal = Boolean(data.is_final);
+      send({ type: 'transcript', text, isFinal });
+
+      // Interim audio means the speaker resumed — cancel any pending answer
+      // so a thinking pause doesn't split one question into multiple.
+      if (!isFinal) {
+        clearFinalizeTimer();
+        return;
+      }
+
+      // Build a single utterance across short pauses.
+      finalBuffer = `${finalBuffer} ${text}`.trim();
+
+      // Prefer Deepgram's end-of-speech signal. Still arm a long fallback on
+      // plain `is_final` so we don't hang if `speech_final` is missing — but
+      // never use the short delay for those mid-pause segment finals.
+      const speechFinal = Boolean(data.speech_final);
+      enqueueFinalize({ fromSpeechFinal: speechFinal });
+    });
+
+    // Fallback end-of-turn when Deepgram's utterance detector fires.
+    if (LiveTranscriptionEvents.UtteranceEnd) {
+      dg.on(LiveTranscriptionEvents.UtteranceEnd, () => {
+        if (dg !== dgConnection) return;
+        if (!finalBuffer.trim()) return;
+        console.log(`[utterance] deepgram UtteranceEnd: "${finalBuffer}"`);
+        enqueueFinalize({ fromSpeechFinal: true });
+      });
+    }
+
+    dg.on(LiveTranscriptionEvents.Error, (err) => {
+      console.error('[deepgram] error', err);
+      send({ type: 'error', message: `Deepgram error: ${err.message || err}` });
+    });
+
+    dg.on(LiveTranscriptionEvents.Close, (closeEvent) => {
+      console.log('[deepgram] closed', closeEvent?.code, closeEvent?.reason);
+      if (dg !== dgConnection) return;
+      dgIsOpen = false;
+      if (clientGone || reconnecting) return;
+      reconnecting = true;
+      send({ type: 'status', message: 'transcription-reconnecting' });
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnecting = false;
+        console.log('[deepgram] reconnecting');
+        startDeepgram();
+      }, 400);
+    });
+  };
+
+  startDeepgram();
 
   clientSocket.on('message', async (chunk, isBinary) => {
     if (!isBinary) {
@@ -568,6 +793,11 @@ wss.on('connection', (clientSocket) => {
         if (message.type === 'clear-history') {
           clearConversationHistory();
           send({ type: 'status', message: 'history-cleared' });
+          return;
+        }
+        if (message.type === 'buddy-mode') {
+          buddyMode = Boolean(message.enabled);
+          console.log(`[buddy] mode ${buddyMode ? 'on' : 'off'}`);
           return;
         }
         if (message.type === 'text-question') {
@@ -585,19 +815,25 @@ wss.on('connection', (clientSocket) => {
     }
     chunkCount += 1;
     if (chunkCount === 1 || chunkCount % 20 === 0) {
-      console.log(`[ws] audio chunk #${chunkCount}, size=${chunk.length}, dgReadyState=${dgConnection.getReadyState()}`);
+      console.log(`[ws] audio chunk #${chunkCount}, size=${chunk.length}, dgReadyState=${dgConnection?.getReadyState?.()}`);
     }
-    if (dgIsOpen) {
+    if (dgIsOpen && dgConnection) {
       dgConnection.send(chunk);
     } else {
-      pendingChunks.push(chunk);
+      bufferChunk(chunk);
     }
   });
 
   clientSocket.on('close', () => {
     console.log(`[ws] client disconnected after ${chunkCount} chunks`);
+    clientGone = true;
+    clearTimeout(reconnectTimer);
     clearFinalizeTimer();
-    dgConnection.finish();
+    try {
+      dgConnection?.finish();
+    } catch (err) {
+      console.warn('[deepgram] finish failed', err.message);
+    }
   });
 });
 
